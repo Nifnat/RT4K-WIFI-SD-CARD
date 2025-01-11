@@ -1,0 +1,6 @@
+cp -r /mnt/o/arduino/SdWiFiBrowser-main-4MB/SdWiFiBrowser/data/ .
+./fs.sh build upload
+cp build/esp32.esp32.pico32/sdwifi.ino.filesystem.bin /mnt/o/arduino/SdWiFiBrowser-main-4MB/SdWiFiBrowser/tools/Flash/binary-4M/
+cp -r /mnt/o/arduino/SdWiFiBrowser-main-4MB .
+arduino-cli compile --fqbn esp32:esp32:pico32:PartitionScheme=no_ota --output-dir build
+cp build/SdWiFiBrowser.ino.bin /mnt/o/arduino/SdWiFiBrowser-main-4MB/SdWiFiBrowser/tools/Flash/binary-4M/

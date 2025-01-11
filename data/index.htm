@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>RT4K WIFI SD</title>
+
+  <!-- load CSS -->
+  <link rel="stylesheet" href="css/bootstrap.min.css">
+  <link rel="stylesheet" href="css/fontawesome-all.min.css">
+  <link rel="stylesheet" href="css/index.css">
+
+  <script src="js/jquery-3.2.1.slim.min.js"></script>
+  <script src="js/index.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js"></script>
+
+</head>
+
+<body>
+  <div class="container">
+    <div class="tm-file-form-container mt-4">
+      <form action="index.html" method="GET" class="form-inline tm-file-form">
+        <div class="text-uppercase tm-setting">Setting</div>
+			<input type="file" id="Choose" value="Choose" class="tm-file-input form-control" name="data">
+			<input id="uploadButton" type="button" value="Upload" class="form-control tm-file-submit">
+			<input id="updateButton" type="button" value="Update List" class="form-control tm-file-submit">
+			<input id="modelineButton" type="button" value="Modeline Editor" class="form-control tm-file-submit">
+        </div>
+      </form>
+    </div>
+	
+	<div id="editorModal" class="modal">
+		<div class="modal-content">
+			<div class="modal-header">
+				<span class="close">&times;</span>
+				<h2>File Editor</h2>
+				<div class="modal-actions">
+					<button class="form-control tm-file-submit" onclick="saveFile()">Save</button>
+					<button class="form-control tm-file-submit" onclick="closeEditor()">Cancel</button>
+				</div>
+			</div>
+			<div id="editor"></div>
+		</div>
+	</div>
+
+    <div class="file-boxes progress-stripes" id="probar">
+      <progress class="file-boxes" id="progressbar" value="0" max="100"></progress>
+    </div>
+
+    <div id="filelist" class="row mt-4 mb-1">
+      <div class="col-xl-12">
+        <div id="filelistbox" class="file-boxes">
+          <!-- Directory listing will be dynamically inserted here -->
+        </div> <!-- filelistbox -->
+      </div>
+    </div>
+
+    <footer class="row">
+      <div class="col-xl-12">
+        <p class="text-center p-4">Copyright &copy; <span class="tm-current-year">2025</span> My arse </a></p>
+      </div>
+    </footer>
+  </div> <!-- .container -->
+</body>
+
+</html>

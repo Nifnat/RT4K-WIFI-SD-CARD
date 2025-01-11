@@ -1,0 +1,183 @@
+/* Dark theme colors */
+:root {
+    --dark-bg: #1e1e1e;
+    --dark-surface: #2d2d2d;
+    --dark-surface-lighter: #363636;
+    --dark-text: #e0e0e0;
+    --dark-text-secondary: #b0b0b0;
+    --accent-blue: #689bd0;
+    --accent-blue-hover: #58d5ff;
+    --accent-red: #b35e6c;
+}
+
+body {
+    font-family: 'Open Sans', Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    font-weight: 300;
+    color: var(--dark-text);
+    background-color: var(--dark-bg);
+    overflow-x: hidden;
+}
+
+a { 
+    transition: all 0.3s ease; 
+    color: var(--accent-blue);
+}
+
+a:hover, a:focus, a.active {
+    color: var(--accent-blue-hover);
+    text-decoration: none;
+}
+
+.tm-file-form-container {
+    border-radius: 10px;
+    border: 1px solid var(--dark-surface-lighter);
+    background-color: var(--dark-surface);
+    margin-top: 50px;
+    margin-bottom: 50px;
+    box-shadow: 0px 0px 5px 0px rgba(0,0,0,0.75);
+}
+
+.form-control {
+    background-color: var(--dark-surface-lighter);
+    color: var(--dark-text);
+    border-color: var(--dark-surface-lighter);
+}
+
+.form-control:focus {
+    background-color: var(--dark-surface);
+    border-color: var(--accent-blue);
+    color: var(--dark-text);
+    box-shadow: none;
+}
+
+.tm-file-submit {
+    background: var(--dark-surface-lighter);
+    color: var(--dark-text);
+    border: 1px solid var(--dark-surface-lighter);
+}
+
+.tm-file-submit:hover {
+    background-color: var(--accent-blue);
+    color: var(--dark-text);
+    border-color: var(--accent-blue);
+}
+
+.tm-setting {
+    background-color: var(--accent-blue);
+    color: var(--dark-text);
+}
+
+/* Editor Modal Styles */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0,0,0,0.7);
+    overflow: hidden; /* Changed from overflow-y: auto */
+}
+
+.modal-content {
+    background-color: var(--dark-surface);
+    margin: 2% auto;
+    padding: 20px;
+    border: 1px solid var(--dark-surface-lighter);
+    width: 90%;
+    height: 90vh;
+    display: flex;
+    flex-direction: column;
+    position: relative; /* Added */
+}
+
+.modal-header {
+    padding: 10px;
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px; /* Added */
+}
+
+#editor {
+    flex: 1;
+    min-height: calc(90vh - 100px); /* Explicit calculation */
+    margin: 0; /* Changed from margin: 10px 0 */
+    border: 1px solid var(--dark-surface-lighter);
+    position: relative; /* Added */
+}
+
+/* Remove the modal-footer styles since we moved the buttons to the header */
+
+.close {
+    color: var(--dark-text);
+    opacity: 0.8;
+}
+
+.close:hover {
+    color: var(--dark-text);
+    opacity: 1;
+}
+
+
+/* File listing styles */
+.file-boxes {
+    background-color: var(--dark-surface);
+    border-radius: 5px;
+    padding: 10px;
+}
+
+/* Button styles */
+button {
+    background-color: var(--dark-surface-lighter);
+    color: var(--dark-text);
+    border: 1px solid var(--dark-surface-lighter);
+    padding: 5px 15px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+button:hover {
+    background-color: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
+/* Text colors */
+.tm-text-gray { color: var(--dark-text-secondary); }
+.tm-text-white { color: var(--dark-text); }
+.tm-text-blue { color: var(--accent-blue); }
+.tm-bg-gray { background-color: var(--dark-surface); }
+
+/* Form placeholder colors */
+.form-control::placeholder {
+    color: var(--dark-text-secondary);
+}
+
+.form-control:-ms-input-placeholder {
+    color: var(--dark-text-secondary);
+}
+
+.form-control::-ms-input-placeholder {
+    color: var(--dark-text-secondary);
+}
+
+/* File list items */
+#filelistbox div {
+    background-color: var(--dark-surface-lighter);
+    margin: 5px 0;
+    padding: 10px;
+    border-radius: 4px;
+}
+
+#filelistbox a {
+    color: var(--dark-text);
+}
+
+#filelistbox a:hover {
+    color: var(--accent-blue);
+}
