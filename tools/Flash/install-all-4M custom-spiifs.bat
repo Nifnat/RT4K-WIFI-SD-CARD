@@ -14,8 +14,8 @@ set SetupArgs=--before default_reset --after hard_reset write_flash -z --flash_m
 set Bootloader=0x1000 %BinaryDir%\bootloader.bin
 set Bootapp=0xe000 %BinaryDir%\boot_app0.bin
 set Partitions=0x8000 %BinaryDir%\partitions.bin
-set Firmware=0x10000 %BinaryDir%\SdWiFiBrowser.ino.bin
-set LocalFS=0x210000 %BinaryDir%\sdwifi.ino.filesystem.bin
+set Firmware=0x10000 %BinaryDir%\RT4K-WIFI-SD-CARD.ino.bin
+set LocalFS=0x210000 %BinaryDir%\RT4K-WIFI-SD-CARD.filesystem.bin
 
 echo %EsptoolPath% %BaseArgs% %SetupArgs% %Bootloader% %Bootapp% %Firmware% %Partitions%
 %EsptoolPath% %BaseArgs% %SetupArgs% %Bootloader% %Bootapp% %Firmware% %Partitions%

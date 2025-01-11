@@ -448,7 +448,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('updateButton').addEventListener('click', updateList);
     document.getElementById('uploadButton').addEventListener('click', () => onClickUpload());
 	document.getElementById('modelineButton').addEventListener('click', () => window.location.href = 'video_timings_calculator.htm');
-    document.querySelector('.tm-setting').addEventListener('click', () => window.location.href = 'wifi.htm');
+	document.getElementById('settings').addEventListener('click', () => window.location.href = 'wifi.htm');
 });
 
 // Helper function for update list button

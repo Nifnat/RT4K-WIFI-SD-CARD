@@ -3,7 +3,6 @@
 #include "config.h"
 #include "pins.h"
 #include "sdControl.h"
-#include <DNSServer.h>
 #include <SPIFFS.h>
 
 #if defined(ARDUINO) && ARDUINO >= 100
@@ -13,12 +12,17 @@
 #endif
 
 #ifdef ESP32
+  #include <ESPmDNS.h>
+#elif defined(ESP8266)
+  #include <ESP8266mDNS.h>
+#endif
+
+#ifdef ESP32
   #include <WiFi.h>
 #elif defined(ESP8266)
   #include <ESP8266WiFi.h>
 #endif
 
-DNSServer dnsServer;
 
 IPAddress AP_local_ip(192, 168, 4, 1);
 IPAddress AP_gateway(192, 168, 4, 1);
@@ -83,6 +87,17 @@ int Network::connect(String ssid, String psd) {
   Serial.print("Connected to "); Serial.println(config.ssid());
   Serial.print("IP address: "); Serial.println(WiFi.localIP());
 
+  // Initialize mDNS
+  if (!MDNS.begin(HOSTNAME)) {
+      Serial.println("Error setting up MDNS responder!");
+  } else {
+      Serial.print("mDNS responder started - hostname: ");
+      Serial.print(HOSTNAME);
+      Serial.println(".local");
+      // Add service to mDNS
+      MDNS.addService("http", "tcp", 80);
+  }
+
   _stamode = true;
   wifiConnected = true;
   wifiConnecting = false;
@@ -131,6 +146,17 @@ int Network::start() {
   wifiConnected = true;
   wifiConnecting = false;
   _stamode = true;
+
+  // Initialize mDNS
+  if (!MDNS.begin(HOSTNAME)) {
+      Serial.println("Error setting up MDNS responder!");
+  } else {
+      Serial.print("mDNS responder started - hostname: ");
+      Serial.print(HOSTNAME);
+      Serial.println(".local");
+      // Add service to mDNS
+      MDNS.addService("http", "tcp", 80);
+  }
 
   return 3;
 }
@@ -210,6 +236,11 @@ void Network::scanWiFi() {
 }
 
 void Network::loop() {
+
+  #ifdef ESP8266
+        MDNS.update();
+  #endif
+  
   if(_doConnect) {
     connect(_ssid,_psd);
     _doConnect = false;
