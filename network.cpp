@@ -88,15 +88,15 @@ int Network::connect(String ssid, String psd) {
   Serial.print("IP address: "); Serial.println(WiFi.localIP());
 
   // Initialize mDNS
-  if (!MDNS.begin(HOSTNAME)) {
-      Serial.println("Error setting up MDNS responder!");
-  } else {
-      Serial.print("mDNS responder started - hostname: ");
-      Serial.print(HOSTNAME);
-      Serial.println(".local");
-      // Add service to mDNS
-      MDNS.addService("http", "tcp", 80);
-  }
+  // if (!MDNS.begin(HOSTNAME)) {
+  //     Serial.println("Error setting up MDNS responder!");
+  // } else {
+  //     Serial.print("mDNS responder started - hostname: ");
+  //     Serial.print(HOSTNAME);
+  //     Serial.println(".local");
+  //     // Add service to mDNS
+  //     MDNS.addService("http", "tcp", 80);
+  // }
 
   _stamode = true;
   wifiConnected = true;
@@ -147,16 +147,16 @@ int Network::start() {
   wifiConnecting = false;
   _stamode = true;
 
-  // Initialize mDNS
-  if (!MDNS.begin(HOSTNAME)) {
-      Serial.println("Error setting up MDNS responder!");
-  } else {
-      Serial.print("mDNS responder started - hostname: ");
-      Serial.print(HOSTNAME);
-      Serial.println(".local");
-      // Add service to mDNS
-      MDNS.addService("http", "tcp", 80);
-  }
+  // // Initialize mDNS
+  // if (!MDNS.begin(HOSTNAME)) {
+  //     Serial.println("Error setting up MDNS responder!");
+  // } else {
+  //     Serial.print("mDNS responder started - hostname: ");
+  //     Serial.print(HOSTNAME);
+  //     Serial.println(".local");
+  //     // Add service to mDNS
+  //     MDNS.addService("http", "tcp", 80);
+  // }
 
   return 3;
 }

@@ -13,6 +13,7 @@ Beta of firmware for SD WIFI PRO for use with a Retrotink 4K
     - Built-in file editor, it needs work but it's ok
     - Some semblance of stability 
 - Port of Modeline calc with ability to one-click write the selected modeline to one of the four custom slots
+- A cool new way to make a RT4K update fail - Don't use for updating firmware on the RT4K
 
 ## Flash Binary firmware to SD WIFI PRO (SWP)
 Run `\tools\Flash\install-all-4M custom-spiifs.bat` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)

@@ -21,7 +21,7 @@ void SDControl::setup() {
 	_spiBlockoutTime = millis();
 	attachInterrupt(CS_SENSE, []() {
 		if(!_weTookBus) {
-			_spiBlockoutTime = millis() + SPI_BLOCKOUT_PERIOD;
+			_spiBlockoutTime = millis() + SPI_BLOCKOUT_PERIOD_MS;
 			//SERIAL_ECHOPAIR("Printer take:",_spiBlockoutTime);
 			//SERIAL_ECHOLNPAIR(",", millis());
 			// _printerRequest = true;
@@ -37,7 +37,7 @@ void SDControl::setup() {
 	#endif
 
 	// Wait for other master to assert SD card first
-	for (int i=0; i<SPI_BLOCKOUT_PERIOD; i++)
+	for (int i=0; i<SPI_BLOCKOUT_BOOTUP_PERIOD; i++)
 	{
 		delay(1000);
 		LOG("Wait for printer to assert SD card first.\n");

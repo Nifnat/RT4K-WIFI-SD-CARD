@@ -225,32 +225,49 @@ bool WebServer::onHttpNotFound(AsyncWebServerRequest *request) {
 }
 
 bool WebServer::handleFileReadSD(String path, AsyncWebServerRequest *request) {
-	DEBUG_LOG("handleFileReadSD: %s\r\n", path.c_str());
+    if (path.endsWith("/"))
+        path += "index.htm";
 
-	if (path.endsWith("/"))
-		path += "index.htm";
-
-	String contentType = getContentType(path, request);
-	String pathWithGz = path + ".gz";
-	sdcontrol.takeControl();
-	if (SD.exists(pathWithGz) || SD.exists(path)) {
-		if (SD.exists(pathWithGz)) {
-			path += ".gz";
-		}
-		DEBUG_LOG("Content type: %s\r\n", contentType.c_str());
-		AsyncWebServerResponse *response = request->beginResponse(SD, path, contentType);
-		if (path.endsWith(".gz"))
-			response->addHeader("Content-Encoding", "gzip");
-		DEBUG_LOG("File %s exist\r\n", path.c_str());
-		request->send(response);
-		DEBUG_LOG("File %s Sent\r\n", path.c_str());
-
-		return true;
-	}
-	else
-		DEBUG_LOG("Cannot find %s\n", path.c_str());
-	sdcontrol.relinquishControl();
-	return false;
+    String contentType = getContentType(path, request);
+    String pathWithGz = path + ".gz";
+    
+    sdcontrol.takeControl();
+    
+    if (SD.exists(pathWithGz) || SD.exists(path)) {
+        if (SD.exists(pathWithGz)) {
+            path += ".gz";
+        }
+        
+        // Create a pointer to File that will be freed in the lambda
+        File* file = new File(SD.open(path.c_str()));
+        if(!*file) {
+            delete file;
+            sdcontrol.relinquishControl();
+            return false;
+        }
+        
+        AsyncWebServerResponse *response = request->beginChunkedResponse(
+            contentType.c_str(),
+            [file](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+                if(!file->available()) {
+                    file->close();
+                    sdcontrol.relinquishControl();
+                    delete file;
+                    return 0;  // Return 0 to indicate end of stream
+                }
+                return file->read(buffer, maxLen);
+            }
+        );
+        
+        if(path.endsWith(".gz"))
+            response->addHeader("Content-Encoding", "gzip");
+            
+        request->send(response);
+        return true;
+    }
+    
+    sdcontrol.relinquishControl();
+    return false;
 }
 
 void WebServer::onHttpRelinquish(AsyncWebServerRequest *request) {
