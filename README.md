@@ -25,7 +25,7 @@ Run `\tools\Flash\install-all-4M custom-spiifs.bat` with SD-WIFI-PRO plugged in 
 SSID=
 PASSWORD=
 ```
-3. On boot of the ESP you can check the serial port to see what IP your router has assigned to it or use `http://rt4ksd.local/` if mDNS decides to work for once
+3. On boot of the ESP you can check the serial port to see what IP your router has assigned to it ~~or use `http://rt4ksd.local/` if mDNS decides to work for once~~ - mDNS broke - who would have guessed?
 
 ## Building 
 Building the code should work via the Arduino IDE although I have had problems with it when using ESP32 v3.x
