@@ -4,3 +4,9 @@ cp build/esp32.esp32.pico32/sdwifi.ino.filesystem.bin /mnt/o/arduino/SdWiFiBrows
 cp -r /mnt/o/arduino/SdWiFiBrowser-main-4MB .
 arduino-cli compile --fqbn esp32:esp32:pico32:PartitionScheme=no_ota --output-dir build
 cp build/SdWiFiBrowser.ino.bin /mnt/o/arduino/SdWiFiBrowser-main-4MB/SdWiFiBrowser/tools/Flash/binary-4M/
+
+
+ /home/nif/.arduino15/packages/esp32/tools/mkspiffs/0.2.3/mkspiffs -c data --page 256 --block 4096 --size 0x1E0000 tools/Flash/binary-4M/RT4K-WIFI-SD-CARD.filesystem.bin
+cp tools/Flash/binary-4M/RT4K-WIFI-SD-CARD.filesystem.bin /mnt/o/arduino/git/RT4K-WIFI-SD-CARD/tools/Flash/binary-4M/
+arduino-cli compile --fqbn esp32:esp32:pico32:PartitionScheme=no_ota --output-dir build
+cp build/RT4K-WIFI-SD-CARD.ino.bin /mnt/o/arduino/git/RT4K-WIFI-SD-CARD/tools/Flash/binary-4M/

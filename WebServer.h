@@ -74,6 +74,7 @@ protected:
     void onHttpWifiAP(AsyncWebServerRequest *request);
     void onHttpWifiList(AsyncWebServerRequest *request);
     void onHttpModeline(AsyncWebServerRequest *request);
+    void onHttpRename(AsyncWebServerRequest *request);
 };
 
 extern WebServer server;

@@ -55,6 +55,10 @@ void WebServer::begin(FS* fs) {
         }
     );
 
+    server.on("/rename", HTTP_POST, [this](AsyncWebServerRequest *request) {
+    this->onHttpRename(request);
+    });
+
     server.on("/modeline", HTTP_POST, [this](AsyncWebServerRequest *request) {
       this->onHttpModeline(request);
     });
@@ -261,7 +265,7 @@ bool WebServer::handleFileReadSD(String path, AsyncWebServerRequest *request) {
         
         if(path.endsWith(".gz"))
             response->addHeader("Content-Encoding", "gzip");
-            
+        response->addHeader("Content-Disposition", "attachment; filename=\"" + path.substring(path.lastIndexOf('/') + 1) + "\"");
         request->send(response);
         return true;
     }
@@ -509,6 +513,57 @@ void WebServer::onHttpFileUpload(AsyncWebServerRequest *request, String filename
         DEBUG_LOG("Upload End\n");
         sdcontrol.relinquishControl();
     }
+}
+
+void WebServer::onHttpRename(AsyncWebServerRequest *request) {
+    switch(sdcontrol.canWeTakeControl()) { 
+        case -1: {
+            DEBUG_LOG("Device controlling the SD card"); 
+            request->send(500, "text/plain", "RENAME:SDBUSY");
+            return;
+        }
+        default: break;
+    }
+
+    if (!request->hasArg("oldPath") || !request->hasArg("newName")) {
+        request->send(500, "text/plain", "RENAME:BADARGS");
+        DEBUG_LOG("Missing oldPath or newName arguments");
+        return;
+    }
+
+    String oldPath = request->arg("oldPath");
+    String newName = request->arg("newName");
+    
+    if (!oldPath.startsWith("/")) {
+        oldPath = "/" + oldPath;
+    }
+
+    String dirPath = oldPath.substring(0, oldPath.lastIndexOf('/') + 1);
+    String newPath = dirPath + newName;
+
+    DEBUG_LOG("Renaming from: %s to: %s\n", oldPath.c_str(), newPath.c_str());
+
+    sdcontrol.takeControl();
+
+    if (!SD.exists(oldPath.c_str())) {
+        request->send(500, "text/plain", "RENAME:SOURCEMISSING");
+        sdcontrol.relinquishControl();
+        return;
+    }
+
+    if (SD.exists(newPath.c_str())) {
+        request->send(500, "text/plain", "RENAME:DESTEXISTS");
+        sdcontrol.relinquishControl();
+        return;
+    }
+
+    if (SD.rename(oldPath.c_str(), newPath.c_str())) {
+        request->send(200, "text/plain", "ok");
+    } else {
+        request->send(500, "text/plain", "RENAME:FAILED");
+    }
+
+    sdcontrol.relinquishControl();
 }
 
 void WebServer::onHttpModeline(AsyncWebServerRequest *request) {

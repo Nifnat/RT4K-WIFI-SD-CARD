@@ -38,6 +38,7 @@ a:hover, a:focus, a.active {
     box-shadow: 0px 0px 5px 0px rgba(0,0,0,0.75);
 }
 
+
 .form-control {
     background-color: var(--dark-surface-lighter);
     color: var(--dark-text);
@@ -66,6 +67,12 @@ a:hover, a:focus, a.active {
 .tm-setting {
     background-color: var(--accent-blue);
     color: var(--dark-text);
+}
+
+/* Keep buttons aligned */
+.btn.tm-dd {
+    margin: 0 2px;
+    padding: 4px 8px;
 }
 
 /* Editor Modal Styles */
@@ -122,7 +129,6 @@ a:hover, a:focus, a.active {
     color: var(--dark-text);
     opacity: 1;
 }
-
 
 /* File listing styles */
 .file-boxes {
