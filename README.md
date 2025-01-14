@@ -1,6 +1,6 @@
 # RT4K WIFI SD CARD Beta Firmware
 
-Beta of firmware for SD WIFI PRO for use with a Retrotink 4K
+Beta firmware for SD WIFI PRO for use with a Retrotink 4K
 
 ## Based on:
 - SdWiFiBrowser @ https://github.com/tiredboffin/SdWiFiBrowser
@@ -11,12 +11,21 @@ Beta of firmware for SD WIFI PRO for use with a Retrotink 4K
     - File browser - Now with directories!!!
     - Uploader - now lets you upload to directories!!!
     - Built-in file editor, it needs work but it's ok
+    - File renaming for renaming profiles
     - Some semblance of stability 
 - Port of Modeline calc with ability to one-click write the selected modeline to one of the four custom slots
 - A cool new way to make a RT4K update fail - Don't use for updating firmware on the RT4K
 
 ## Flash Binary firmware to SD WIFI PRO (SWP)
-Run `\tools\Flash\install-all-4M custom-spiifs.bat` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)
+
+Windows:
+Run `tools\Flash\binary-merged\flash-merged.bat` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)
+
+Linux:
+Run `tools\Flash\binary-merged\flash-merged.sh` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)
+
+Backup flashing if the merged bin fails:
+Run `tools\Flash\install-all-4M custom-spiifs.bat` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)
 
 ## Access SD WIFI PRO (SWP)
 1. Add a text file to the root of the SD card named `config.txt`
