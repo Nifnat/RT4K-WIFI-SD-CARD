@@ -167,10 +167,11 @@ unsigned char Config::load(FS* fs) {
     }
 
     // Fall back to defaults if both methods fail
-    SERIAL_ECHOLN("No valid config found, using defaults");
-    const char* default_ssid = "ssid";
-    const char* default_password = "password";
-    save(default_ssid, default_password);
+    // Uncomment the below if you want a shit's fucked fallback for WIFI con
+    // SERIAL_ECHOLN("No valid config found, using defaults");
+    // const char* default_ssid = "ssid";
+    // const char* default_password = "password";
+    // save(default_ssid, default_password);
     return 0;
 }
 
