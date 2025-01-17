@@ -96,28 +96,48 @@ FAIL:
     return rst;
 }
 
+bool Config::validateEEPROMData() {
+    SERIAL_ECHO("Validating EEPROM - Flag: ");
+    SERIAL_ECHOLN(data.flag);
+    
+    if (!data.flag) {
+        SERIAL_ECHOLN("Flag check failed");
+        return false;
+    }
+    
+    size_t ssidLen = strnlen(data.ssid, WIFI_SSID_LEN);
+    SERIAL_ECHO("SSID Length: ");
+    SERIAL_ECHO(ssidLen);
+    SERIAL_ECHO(" SSID: ");
+    SERIAL_ECHOLN(data.ssid);
+    
+    if (ssidLen == 0 || ssidLen >= WIFI_SSID_LEN) {
+        SERIAL_ECHOLN("SSID length check failed");
+        return false;
+    }
+    
+    size_t pswLen = strnlen(data.psw, WIFI_PASSWD_LEN);
+    SERIAL_ECHO("PSW Length: ");
+    SERIAL_ECHOLN(pswLen);
+    
+    if (pswLen == 0 || pswLen >= WIFI_PASSWD_LEN) {
+        SERIAL_ECHOLN("Password length check failed");
+        return false;
+    }
+    
+    for (size_t i = 0; i < ssidLen; i++) {
+        if (data.ssid[i] < 32 || data.ssid[i] > 126) return false;
+    }
+    
+    for (size_t i = 0; i < pswLen; i++) {
+        if (data.psw[i] < 32 || data.psw[i] > 126) return false;
+    }
+    
+    return true;
+}
+
 unsigned char Config::load(FS* fs) {
-    switch(sdcontrol.canWeTakeControl()) { 
-        case -1:
-            SERIAL_ECHOLN("Device controlling the SD card");
-            goto TRY_EEPROM;
-        default: break;
-    }
-
-    SERIAL_ECHOLN("SD card access granted, attempting to load config");
-    sdcontrol.takeControl();
-    
-    if (0 == loadFS()) {
-        SERIAL_ECHOLN("Successfully loaded from SD, saving to EEPROM");
-        save(data.ssid, data.psw);
-        sdcontrol.relinquishControl();
-        return 1;
-    }
-    
-    sdcontrol.relinquishControl();
-    SERIAL_ECHOLN("Failed to load from SD card");
-
-TRY_EEPROM:
+    // Try EEPROM first
     SERIAL_ECHOLN("Attempting to load from EEPROM");
     EEPROM.begin(EEPROM_SIZE);
     uint8_t *p = (uint8_t*)(&data);
@@ -126,11 +146,27 @@ TRY_EEPROM:
     }
     EEPROM.commit();
 
-    if (data.flag) {
-        SERIAL_ECHOLN("Successfully loaded from EEPROM");
+    if (validateEEPROMData()) {
+        SERIAL_ECHOLN("Successfully loaded valid config from EEPROM");
         return data.flag;
     }
 
+    // If EEPROM fails, try SD card
+    if (sdcontrol.canWeTakeControl() != -1) {
+        SERIAL_ECHOLN("SD card access granted, attempting to load config");
+        sdcontrol.takeControl();
+        
+        if (0 == loadFS()) {
+            SERIAL_ECHOLN("Successfully loaded from SD, saving to EEPROM");
+            save(data.ssid, data.psw);
+            sdcontrol.relinquishControl();
+            return 1;
+        }
+        sdcontrol.relinquishControl();
+        SERIAL_ECHOLN("Failed to load from SD card");
+    }
+
+    // Fall back to defaults if both methods fail
     SERIAL_ECHOLN("No valid config found, using defaults");
     const char* default_ssid = "ssid";
     const char* default_password = "password";
@@ -174,7 +210,6 @@ void Config::save(const char* ssid, const char* password) {
 void Config::save() {
   if (data.ssid == NULL || data.psw == NULL)
     return;
-
   EEPROM.begin(EEPROM_SIZE);
   data.flag = 1;
   uint8_t *p = (uint8_t*)(&data);

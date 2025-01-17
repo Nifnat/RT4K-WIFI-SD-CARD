@@ -27,6 +27,7 @@ public:
   void save(const char* ssid, const char* password);
   void save();
   void clear();
+  bool validateEEPROMData();
 
 private:
   FS* _fs;

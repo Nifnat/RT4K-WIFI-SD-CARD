@@ -1,8 +1,8 @@
 #ifndef _SD_CONTROL_H_
 #define _SD_CONTROL_H_
 
-#define SPI_BLOCKOUT_BOOTUP_PERIOD	25UL // Second
-#define SPI_BLOCKOUT_PERIOD	5UL // Second
+#define SPI_BLOCKOUT_BOOTUP_PERIOD	10UL // Second
+#define SPI_BLOCKOUT_PERIOD	5UL // microsecond
 #define SPI_BLOCKOUT_PERIOD_MS (SPI_BLOCKOUT_PERIOD * 1000UL)
 
 class SDControl {
