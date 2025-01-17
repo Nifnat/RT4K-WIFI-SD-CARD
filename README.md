@@ -75,7 +75,7 @@ I've only tested this in Linux, so who knows:
 
 Copy `RT4K-WIFI-SD-CARD.ino.bin` into `tools/Flash/binary-XM` (likely using the 4M version)
 
-Optional:  
+Optional-Merged:  
 `tools\Flash\merge_bin.bat` is a batch file to merge all of the seperate bins to one bin for flashing (SH file coming soon TM)
 
-From there you can run the `install-all-4M custom-spiifs.bat` flashing the sepertate bins or binary-merged run the `flash-merged.X` where X is either bat or sh depending on your OS
+From there you can run the `install-all-4M custom-spiifs.bat` flashing the sepertate bins or Optional-Merged: run the `flash-merged.X` where X is either bat or sh depending on your OS
