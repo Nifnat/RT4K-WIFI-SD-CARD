@@ -19,6 +19,9 @@
 
 #ifdef ESP32
   #include <WiFi.h>
+  #include <esp_pm.h>
+  #include <esp_wifi.h>
+  #include <esp_wifi_types.h>
 #elif defined(ESP8266)
   #include <ESP8266WiFi.h>
 #endif
@@ -142,6 +145,11 @@ int Network::start() {
   SERIAL_ECHOLN("");
   SERIAL_ECHO("Connected to "); SERIAL_ECHOLN(config.ssid());
   SERIAL_ECHO("IP address: "); SERIAL_ECHOLN(WiFi.localIP());
+
+  // Set power mode to min modem
+  if (esp_wifi_set_ps(WIFI_PS_MIN_MODEM) != ESP_OK) {
+      SERIAL_ECHOLN("Failed to enable minimum modem power save");
+  }
 
   wifiConnected = true;
   wifiConnecting = false;
