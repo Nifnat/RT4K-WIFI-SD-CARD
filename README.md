@@ -14,7 +14,9 @@ Beta firmware for SD WIFI PRO for use with a Retrotink 4K
     - File renaming for renaming profiles
     - Some semblance of stability - I've had no crashes at all in my own testing and certainly no lockups requiring a reboot of the ESP32. Large (10MB+) filetransfers or editing will likely take ages and possibly fail but so far have not resulted in lockups. This is not a guarantee though.
 - Port of Modeline calc with ability to one-click write the selected modeline to one of the four custom slots
+    - Now also lets you read current custom modelines. 
 - A cool new way to make an RT4K update fail - Latest updates to this firmware should avoid locking the SD card to the ESP32 on boot if valid WiFi creds are stored in EEPROM, but this is not a guarantee.
+    - I have had no issues uploading firmware updates and then installing them off the SD-WIFI card, but I would still recommend using an actual SD card for this.
 
 ## Flash Binary firmware to SD WIFI PRO (SWP)
 
