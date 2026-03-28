@@ -59,7 +59,7 @@ Building the code should work via the Arduino IDE although I have had problems w
 - ArduinoJson 7.3.0
 - SPI 3.1.1
 - SD 3.1.1
-- ESPmDNS 3.1.1
+- ESDNSPm 3.1.1
 - SD_MMC 3.1.1
 
 ### Command for building via CLI
