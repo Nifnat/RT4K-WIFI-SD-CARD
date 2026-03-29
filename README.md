@@ -35,9 +35,10 @@ Reflash:
 See above
 
 OTA:
-In the settings menu upload the correct bin and the ESP will perform an OTA
+In the settings menu upload the correct bin and the ESP will perform an OTA.
+
 There are 2 possible bins to upload, rt4k-wifi-sd-card.bin for the code and storage.bin for the SPIFFS partition (static files for the web UI)
-Depending on what's been updated you might only have to flash one of these but it's best to flash both
+Depending on what's been updated you might only have to flash one of these but it's best to flash both.
 
 ## Access SD WIFI PRO (SWP)
 1. Access the softAP RT4K-SD-WIFI
