@@ -264,6 +264,14 @@ static esp_err_t handle_download(httpd_req_t *req)
 
     sd_control_take();
 
+    struct stat file_stat;
+    if (stat(full_path, &file_stat) != 0) {
+        httpd_resp_set_status(req, "404");
+        httpd_resp_sendstr(req, "DOWNLOAD:FileNotFound");
+        sd_control_relinquish();
+        return ESP_OK;
+    }
+
     FILE *f = fopen(full_path, "r");
     if (!f) {
         httpd_resp_set_status(req, "404");
@@ -276,11 +284,21 @@ static esp_err_t handle_download(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
+    char len_str[16];
+    snprintf(len_str, sizeof(len_str), "%ld", (long)file_stat.st_size);
+    httpd_resp_set_hdr(req, "Content-Length", len_str);
+
     /* Extract filename for Content-Disposition */
     const char *fname = strrchr(file_path, '/');
     fname = fname ? fname + 1 : file_path;
+    char safe_fname[256];
+    snprintf(safe_fname, sizeof(safe_fname), "%s", fname);
+    /* Sanitize: strip characters that break the header */
+    for (char *p = safe_fname; *p; p++) {
+        if (*p == '"' || *p == '\r' || *p == '\n') *p = '_';
+    }
     char disp[300];
-    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", fname);
+    snprintf(disp, sizeof(disp), "attachment; filename=\"%s\"", safe_fname);
     httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
     /* Stream file in chunks */
@@ -821,11 +839,13 @@ static esp_err_t handle_wifi_list(httpd_req_t *req)
 
 /* ─── Static file serving from SPIFFS ─────────────────────────────── */
 
+#if 0
 /* Check if a string looks like a raw IP address (starts with digit) */
 static bool host_is_ip(const char *host, size_t len)
 {
     return len > 0 && host[0] >= '0' && host[0] <= '9';
 }
+#endif
 
 static esp_err_t handle_static(httpd_req_t *req)
 {
@@ -959,11 +979,31 @@ static esp_err_t handle_sd_access_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ─── OTA auth helper ──────────────────────────────────────────────── */
+
+static bool check_ota_auth(httpd_req_t *req)
+{
+    char stored_pass[OTA_PASS_HASH_LEN];
+    if (!rt4k_config_get_ota_password(stored_pass, sizeof(stored_pass))) {
+        return true; /* No password set — allow */
+    }
+
+    char hdr_val[128] = "";
+    if (httpd_req_get_hdr_value_str(req, "X-OTA-Password", hdr_val, sizeof(hdr_val)) != ESP_OK
+        || !rt4k_config_check_ota_password(hdr_val)) {
+        httpd_resp_set_status(req, "401");
+        httpd_resp_sendstr(req, "Unauthorized - incorrect OTA password");
+        return false;
+    }
+    return true;
+}
+
 /* ─── /ota ─────────────────────────────────────────────────────────── */
 
 static esp_err_t handle_ota(httpd_req_t *req)
 {
     set_cors_headers(req);
+    if (!check_ota_auth(req)) return ESP_OK;
 
     int content_len = req->content_len;
     if (content_len <= 0) {
@@ -1080,6 +1120,7 @@ static esp_err_t handle_ota(httpd_req_t *req)
 static esp_err_t handle_ota_spiffs(httpd_req_t *req)
 {
     set_cors_headers(req);
+    if (!check_ota_auth(req)) return ESP_OK;
 
     int content_len = req->content_len;
     if (content_len <= 0) {
@@ -1181,13 +1222,72 @@ static esp_err_t handle_ota_spiffs(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ─── /ota_auth_check ──────────────────────────────────────────────── */
+
+static esp_err_t handle_ota_auth_check(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    if (!check_ota_auth(req)) return ESP_OK; /* sends 401 */
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/* ─── /ota_password ────────────────────────────────────────────────── */
+
+static esp_err_t handle_ota_password_get(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    char pass[OTA_PASS_HASH_LEN];
+    bool has = rt4k_config_get_ota_password(pass, sizeof(pass));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, has ? "{\"hasPassword\":true}" : "{\"hasPassword\":false}");
+    return ESP_OK;
+}
+
+static esp_err_t handle_ota_password_post(httpd_req_t *req)
+{
+    set_cors_headers(req);
+
+    char *body = NULL;
+    int len = read_post_body(req, &body);
+    if (len < 0) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "Bad request");
+        return ESP_OK;
+    }
+
+    char current[64] = "";
+    char newpass[64] = "";
+    parse_form_field(body, "current", current, sizeof(current));
+    parse_form_field(body, "password", newpass, sizeof(newpass));
+    free(body);
+
+    /* If a password is already set, require current password to change it */
+    char stored[OTA_PASS_HASH_LEN];
+    if (rt4k_config_get_ota_password(stored, sizeof(stored))) {
+        if (!rt4k_config_check_ota_password(current)) {
+            httpd_resp_set_status(req, "401");
+            httpd_resp_sendstr(req, "Current password incorrect");
+            return ESP_OK;
+        }
+    }
+
+    if (rt4k_config_set_ota_password(newpass)) {
+        httpd_resp_sendstr(req, "OK");
+    } else {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Failed to save password");
+    }
+    return ESP_OK;
+}
+
 /* ─── OPTIONS preflight handler (Chrome Private Network Access) ──── */
 
 static esp_err_t handle_options(httpd_req_t *req)
 {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, X-OTA-Password");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Private-Network", "true");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
@@ -1198,11 +1298,12 @@ static esp_err_t handle_options(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 22;
+    config.max_uri_handlers = 25;
     config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.recv_wait_timeout = 30;  /* 30s for large uploads */
-    config.send_wait_timeout = 30;
+    config.recv_wait_timeout = 60;  /* 60s for large uploads over weak WiFi */
+    config.send_wait_timeout = 60;
+    config.lru_purge_enable = true;
 
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
@@ -1228,6 +1329,9 @@ esp_err_t web_server_start(void)
         { .uri = "/wifilist",   .method = HTTP_GET,  .handler = handle_wifi_list },
         { .uri = "/ota",        .method = HTTP_POST, .handler = handle_ota },
         { .uri = "/ota_spiffs", .method = HTTP_POST, .handler = handle_ota_spiffs },
+        { .uri = "/ota_auth_check", .method = HTTP_GET, .handler = handle_ota_auth_check },
+        { .uri = "/ota_password", .method = HTTP_GET,  .handler = handle_ota_password_get },
+        { .uri = "/ota_password", .method = HTTP_POST, .handler = handle_ota_password_post },
         { .uri = "/*",          .method = HTTP_GET,     .handler = handle_static },
         { .uri = "/*",          .method = HTTP_OPTIONS, .handler = handle_options },
     };

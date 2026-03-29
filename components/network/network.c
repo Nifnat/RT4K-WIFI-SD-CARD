@@ -11,6 +11,7 @@
 #include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "network";
 
@@ -30,6 +31,7 @@ static char s_ip_str[16] = "";
 static wifi_ap_record_t s_scan_results[20];
 static uint16_t s_scan_count = 0;
 static bool s_scan_done = false;
+static SemaphoreHandle_t s_scan_mutex = NULL;
 
 /* Pending connection request from web UI */
 static bool s_connect_pending = false;
@@ -62,9 +64,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             break;
 
         case WIFI_EVENT_SCAN_DONE:
+            xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
             s_scan_count = sizeof(s_scan_results) / sizeof(s_scan_results[0]);
             esp_wifi_scan_get_ap_records(&s_scan_count, s_scan_results);
             s_scan_done = true;
+            xSemaphoreGive(s_scan_mutex);
             ESP_LOGI(TAG, "Scan complete: %d networks found", s_scan_count);
             break;
 
@@ -103,6 +107,7 @@ static void start_mdns(void)
 esp_err_t network_init(void)
 {
     s_wifi_event_group = xEventGroupCreate();
+    s_scan_mutex = xSemaphoreCreateMutex();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -276,8 +281,10 @@ bool network_connect(const char *ssid, const char *password)
 
 void network_start_scan(void)
 {
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
     s_scan_done = false;
     s_scan_count = 0;
+    xSemaphoreGive(s_scan_mutex);
 
     wifi_scan_config_t scan_cfg = {
         .show_hidden = false,
@@ -291,7 +298,10 @@ void network_start_scan(void)
 
 int network_get_scan_results_json(char *buf, size_t buf_len)
 {
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+
     if (!s_scan_done || s_scan_count == 0) {
+        xSemaphoreGive(s_scan_mutex);
         return snprintf(buf, buf_len, "[]");
     }
 
@@ -308,6 +318,7 @@ int network_get_scan_results_json(char *buf, size_t buf_len)
     }
 
     pos += snprintf(buf + pos, buf_len - pos, "]");
+    xSemaphoreGive(s_scan_mutex);
     return pos;
 }
 

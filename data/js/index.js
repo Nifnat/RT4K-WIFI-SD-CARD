@@ -8,74 +8,10 @@ if (navigator.userAgent.indexOf('MSIE') !== -1
     renderPage = false;
 }
 
-function httpPost(filename, data, type) {
-    xmlHttp = new XMLHttpRequest();
-    xmlHttp.onreadystatechange = httpPostProcessRequest;
-    var formData = new FormData();
-    formData.append("data", new Blob([data], { type: type }), filename);
-    xmlHttp.open("POST", "/edit");
-    xmlHttp.send(formData);
-}
-
-function httpGetList(path) {
-    xmlHttp = new XMLHttpRequest(path);
-    xmlHttp.onload = function () {
-        sdbusy = false;
-    }
-    xmlHttp.onreadystatechange = function () {
-        var resp = xmlHttp.responseText;
-        if (xmlHttp.readyState == 4) {
-            console.log("Get response of path:");
-            console.log(resp);
-
-            if (xmlHttp.status == 200)
-                onHttpList(resp);
-
-            if( resp.startsWith('LIST:')) {
-                if(resp.includes('SDBUSY')) {
-                    alert("Printer is busy, wait for 10s and try again");
-                } else if(resp.includes('BADARGS') || 
-                            resp.includes('BADPATH') ||
-                            resp.includes('NOTDIR')) {
-                    alert("Bad args, please try again or reset the module");
-                }
-            }
-        }
-    };
-    xmlHttp.open('GET', '/list?dir=' + path, true);
-    xmlHttp.send(null);
-}
-
-function httpGetGcode(path) {
-    xmlHttp = new XMLHttpRequest(path);
-    xmlHttp.onreadystatechange = function () {
-        var resp = xmlHttp.responseText;
-        if (xmlHttp.readyState == 4) {
-
-            console.log("Get download response:");
-            console.log(xmlHttp.responseText);
-
-            if( resp.startsWith('DOWNLOAD:')) {
-                if(resp.includes('SDBUSY')) {
-                    alert("Printer is busy, wait for 10s and try again");
-                } else if(resp.includes('BADARGS')) {
-                    alert("Bad args, please try again or reset the module");
-                }
-            }
-        }
-    };
-    xmlHttp.open('GET', '/download?dir=' + path, true);
-    xmlHttp.send(null);
-}
-
 function httpRelinquishSD() {
-    xmlHttp = new XMLHttpRequest();
-    xmlHttp.open('GET', '/relinquish', true);
-    xmlHttp.send();
-}
-
-function onClickSelect() {
-    var obj = document.getElementById('filelistbox').innerHTML = "";
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/relinquish', true);
+    xhr.send();
 }
 
 function onClickDelete(filename) {
@@ -86,13 +22,17 @@ function onClickDelete(filename) {
     sdbusy = true;
 
     console.log('delete: %s', filename);
-    xmlHttp = new XMLHttpRequest();
-    xmlHttp.onload = function () {
+    var xhr = new XMLHttpRequest();
+    xhr.onload = function () {
         sdbusy = false;
         updateList();
     };
-    xmlHttp.onreadystatechange = function () {
-        var resp = xmlHttp.responseText;
+    xhr.onerror = function () {
+        sdbusy = false;
+        alert('Delete failed - connection error');
+    };
+    xhr.onreadystatechange = function () {
+        var resp = xhr.responseText;
 
         if( resp.startsWith('DELETE:')) {
             if(resp.includes('SDBUSY')) {
@@ -103,8 +43,8 @@ function onClickDelete(filename) {
             }
         }
     };
-    xmlHttp.open('GET', '/delete?path=' + filename, true);
-    xmlHttp.send();
+    xhr.open('GET', '/delete?path=' + filename, true);
+    xhr.send();
 }
 
 function getContentType(filename) {
@@ -167,65 +107,11 @@ function onClickDownload(filename) {
       }
     };
     xhr.onerror = function (e) {
-        alert(e);
+        sdbusy = false;
         alert('Download failed!');
         document.getElementById('probar').style.display="none";
     }
     xhr.send();
-}
-
-function onUploaded(evt) {
-    $("div[role='progressbar']").css("width",0);
-    $("div[role='progressbar']").attr('aria-valuenow',0);
-    document.getElementById('probar').style.display="none";
-    updateList();
-    sdbusy = true;
-    document.getElementById('uploadButton').disabled = false;
-    alert('Upload done!');
-}
-
-function onUploadFailed(evt) {
-    document.getElementById('probar').style.display="none";
-    document.getElementById('uploadButton').disabled = false;
-    alert('Upload failed!');
-}
-
-function onUploading(evt) {
-    var progressBar = document.getElementById('progressbar');
-    if (evt.lengthComputable) {
-      progressBar.max = evt.total;
-      progressBar.value = evt.loaded;
-    }
-}
-
-function onClickUpload() {
-    if(sdbusy) {
-        alert("SD card is busy");
-        return
-    }
-
-    var input = document.getElementById('Choose');
-    if (input.files.length === 0) {
-        alert("Please choose a file first");
-        return;
-    }
-
-    sdbusy = true;
-
-    // document.getElementById('uploadbutton').css("pointerEvents","none");
-    document.getElementById('uploadButton').disabled = true;
-    document.getElementById('probar').style.display="block";
-    
-    xmlHttp = new XMLHttpRequest();
-    xmlHttp.onload = onUploaded;
-    xmlHttp.onerror = onUploadFailed;
-    xmlHttp.upload.onprogress = onUploading;
-    var formData = new FormData();
-    var savePath = '';
-    savePath = '/' + input.files[0].name;
-    formData.append('data', input.files[0], savePath);
-    xmlHttp.open('POST', '/upload');
-    xmlHttp.send(formData);
 }
 
 function niceBytes(x){
@@ -238,25 +124,6 @@ function niceBytes(x){
     return(n.toFixed(n < 10 && l > 0 ? 1 : 0) + ' ' + units[l]);
 }
 
-function onHttpList(response) {
-    const fileList = document.getElementById('filelistbox');
-    const files = JSON.parse(response);
-}
-
-function updateList() {
-    document.getElementById('filelistbox').innerHTML = "";
-    httpGetList('/');
-}
-
-function onClickUpdateList() {
-    if(sdbusy) {
-        alert("SD card is busy");
-        return
-    }
-    sdbusy = true;
-
-    updateList();
-}
 
 
 // Global variables

@@ -8,12 +8,25 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "mbedtls/sha256.h"
 
 static const char *TAG = "config";
 
 #define NVS_NAMESPACE "wifi_cfg"
 #define NVS_KEY_SSID  "ssid"
 #define NVS_KEY_PASS  "password"
+#define NVS_KEY_OTA_PASS "ota_pass"
+
+/* Hash a string with SHA-256 and write 64 hex chars + null to output */
+static void sha256_hex(const char *input, char *output)
+{
+    unsigned char hash[32];
+    mbedtls_sha256((const unsigned char *)input, strlen(input), hash, 0);
+    for (int i = 0; i < 32; i++) {
+        sprintf(output + i * 2, "%02x", hash[i]);
+    }
+    output[64] = '\0';
+}
 
 /* Validate that a string contains only printable ASCII (32-126) */
 static bool validate_ascii(const char *str, size_t max_len)
@@ -208,4 +221,58 @@ void rt4k_config_clear(void)
         nvs_close(handle);
     }
     ESP_LOGI(TAG, "Config cleared");
+}
+
+bool rt4k_config_get_ota_password(char *buf, size_t buf_len)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) return false;
+
+    err = nvs_get_str(handle, NVS_KEY_OTA_PASS, buf, &buf_len);
+    nvs_close(handle);
+
+    if (err != ESP_OK || buf_len <= 1) {
+        buf[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+bool rt4k_config_set_ota_password(const char *password)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (password[0] == '\0') {
+        nvs_erase_key(handle, NVS_KEY_OTA_PASS);
+    } else {
+        char hash_hex[OTA_PASS_HASH_LEN];
+        sha256_hex(password, hash_hex);
+        err = nvs_set_str(handle, NVS_KEY_OTA_PASS, hash_hex);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "NVS set ota_pass failed: %s", esp_err_to_name(err));
+            nvs_close(handle);
+            return false;
+        }
+    }
+
+    err = nvs_commit(handle);
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+bool rt4k_config_check_ota_password(const char *password)
+{
+    char stored[OTA_PASS_HASH_LEN];
+    if (!rt4k_config_get_ota_password(stored, sizeof(stored))) {
+        return false;
+    }
+    char hash_hex[OTA_PASS_HASH_LEN];
+    sha256_hex(password, hash_hex);
+    return strcmp(hash_hex, stored) == 0;
 }

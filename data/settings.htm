@@ -35,7 +35,7 @@
             function updateWifiStatus() {
                 var status = document.getElementById('status');
 
-                xmlHttp = new XMLHttpRequest();
+                var xmlHttp = new XMLHttpRequest();
                 xmlHttp.onreadystatechange = function () {
                     var resp = xmlHttp.responseText;
                     if (xmlHttp.readyState == 4 && xmlHttp.status == 200) {
@@ -85,8 +85,9 @@
 
                 var status = document.getElementById('status');
                 status.innerText = "Connecting, please wait ...";
+                document.getElementById('connectBtn').disabled = true;
 
-                xmlHttp = new XMLHttpRequest();
+                var xmlHttp = new XMLHttpRequest();
                 xmlHttp.onreadystatechange = function () {
                     var resp = xmlHttp.responseText;
                     if (xmlHttp.readyState == 4 && xmlHttp.status == 200) {
@@ -94,16 +95,16 @@
                         console.log(xmlHttp.responseText);
                         if( resp.startsWith('WIFI:')) {
                             if(resp.includes('Starting')) {
-                                // Start to connect wifi AP, need to check the wifi status.
                                 console.log("start update timer");
                                 setTimeout(updateWifiStatus,3000);
-                                // setTimeout(onClickConnect,3000);
                             }
                             else if(resp.includes('AlreadyCon')) {
                                 status.innerText = "Already connected to the " + ssid + ". IP address: " + resp.substr(resp.lastIndexOf(':')+1);
+                                document.getElementById('connectBtn').disabled = false;
                             }
                             else {
                                 alert(resp);
+                                document.getElementById('connectBtn').disabled = false;
                             }
                         }
                     }
@@ -113,8 +114,9 @@
                     xmlHttp.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
                     xmlHttp.send('ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(password));
                 } catch(error) {
-                        console.log("Get error response0:" + error);
-                    }
+                    console.log("Get error response0:" + error);
+                    document.getElementById('connectBtn').disabled = false;
+                }
                 }
 
             function onHttpWifiList(response) {
@@ -163,6 +165,11 @@
                         document.getElementById('scanBtn').value = 'Scan for Networks';
                     }
                 };
+                xhr.onerror = function () {
+                    document.getElementById('scanBtn').disabled = false;
+                    document.getElementById('scanBtn').value = 'Scan for Networks';
+                    alert('Failed to retrieve scan results');
+                };
                 xhr.open('GET', '/wifilist', true);
                 xhr.send(null);
             }
@@ -179,6 +186,11 @@
                         setTimeout(getWifiList, 3000);
                     }
                 };
+                xhr.onerror = function () {
+                    scanBtn.disabled = false;
+                    scanBtn.value = 'Scan for Networks';
+                    alert('Scan request failed - connection error');
+                };
                 xhr.open('GET', '/wifiscan', true);
                 xhr.send(null);
             }
@@ -187,7 +199,7 @@
                 var status = document.getElementById('status');
                 status.innerText = "Start AP:SD-WIFI-PRO, IP: 192.168.4.1";
                 console.log("onClickAPMode");
-                xmlHttp = new XMLHttpRequest();
+                var xmlHttp = new XMLHttpRequest();
                 xmlHttp.onreadystatechange = function () {
                     var resp = xmlHttp.responseText;
                     if (xmlHttp.readyState == 4) {
@@ -222,7 +234,7 @@
                     <label>Password</label>
                     <input id="password" type="password" name="password">
                 </div>
-                <input class="btn" type="button" value="Connect" onclick="onClickConnect()" />
+                <input class="btn" type="button" id="connectBtn" value="Connect" onclick="onClickConnect()" />
                 <input class="btn" type="button" value="Go to AP Mode" onclick="onClickAPMode()" />
                 <span id="status" class="status-box"></span>
             </form>
@@ -250,7 +262,56 @@
             <span id="spiffsStatus" class="status-box"></span>
         </div>
 
+        <div class="container">
+            <h2>OTA Password</h2>
+            <div id="otaPassInfo" class="status-box" style="margin-bottom:10px;"></div>
+            <div id="otaPassCurrentGroup" class="form-group" style="display:none;">
+                <label>Current Password</label>
+                <input id="otaPassCurrent" type="password">
+            </div>
+            <div class="form-group">
+                <label>New Password (leave empty to remove)</label>
+                <input id="otaPassNew" type="password">
+            </div>
+            <input class="btn" type="button" id="otaPassBtn" value="Save OTA Password" onclick="saveOtaPassword()" />
+            <span id="otaPassStatus" class="status-box"></span>
+        </div>
+
         <script>
+            function checkOtaAuth(callback) {
+                var xhr = new XMLHttpRequest();
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        callback(null);
+                    } else if (xhr.status === 401) {
+                        var pass = prompt('OTA password required:');
+                        if (pass) {
+                            var xhr2 = new XMLHttpRequest();
+                            xhr2.onload = function() {
+                                if (xhr2.status === 200) {
+                                    callback(pass);
+                                } else {
+                                    alert('Incorrect OTA password');
+                                }
+                            };
+                            xhr2.onerror = function() {
+                                alert('Auth check failed - connection error');
+                            };
+                            xhr2.open('GET', '/ota_auth_check');
+                            xhr2.setRequestHeader('X-OTA-Password', pass);
+                            xhr2.send(null);
+                        }
+                    } else {
+                        alert('Auth check failed: ' + xhr.responseText);
+                    }
+                };
+                xhr.onerror = function() {
+                    alert('Auth check failed - connection error');
+                };
+                xhr.open('GET', '/ota_auth_check');
+                xhr.send(null);
+            }
+
             function startOta() {
                 var fileInput = document.getElementById('otaFile');
                 var btn = document.getElementById('otaBtn');
@@ -272,43 +333,46 @@
                     return;
                 }
 
-                btn.disabled = true;
-                progress.style.display = 'block';
-                progress.value = 0;
-                status.innerText = 'Uploading firmware...';
-                status.style.color = '';
+                checkOtaAuth(function(otaPass) {
+                    btn.disabled = true;
+                    progress.style.display = 'block';
+                    progress.value = 0;
+                    status.innerText = 'Uploading firmware...';
+                    status.style.color = '';
 
-                var xhr = new XMLHttpRequest();
-                xhr.upload.onprogress = function(e) {
-                    if (e.lengthComputable) {
-                        var pct = Math.round((e.loaded / e.total) * 100);
-                        progress.max = e.total;
-                        progress.value = e.loaded;
-                        status.innerText = 'Uploading... ' + pct + '%';
-                    }
-                };
-                xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        status.innerText = 'Update successful! Rebooting...';
-                        status.style.color = '#28a745';
-                        setTimeout(function() {
-                            status.innerText = 'Rebooting... page will reload in 10 seconds.';
-                            setTimeout(function() { window.location.reload(); }, 10000);
-                        }, 2000);
-                    } else {
-                        status.innerText = 'Update failed: ' + xhr.responseText;
+                    var xhr = new XMLHttpRequest();
+                    xhr.upload.onprogress = function(e) {
+                        if (e.lengthComputable) {
+                            var pct = Math.round((e.loaded / e.total) * 100);
+                            progress.max = e.total;
+                            progress.value = e.loaded;
+                            status.innerText = 'Uploading... ' + pct + '%';
+                        }
+                    };
+                    xhr.onload = function() {
+                        if (xhr.status === 200) {
+                            status.innerText = 'Update successful! Rebooting...';
+                            status.style.color = '#28a745';
+                            setTimeout(function() {
+                                status.innerText = 'Rebooting... page will reload in 10 seconds.';
+                                setTimeout(function() { window.location.reload(); }, 10000);
+                            }, 2000);
+                        } else {
+                            status.innerText = 'Update failed: ' + xhr.responseText;
+                            status.style.color = '#dc3545';
+                            btn.disabled = false;
+                        }
+                    };
+                    xhr.onerror = function() {
+                        status.innerText = 'Upload failed - connection error';
                         status.style.color = '#dc3545';
                         btn.disabled = false;
-                    }
-                };
-                xhr.onerror = function() {
-                    status.innerText = 'Upload failed - connection error';
-                    status.style.color = '#dc3545';
-                    btn.disabled = false;
-                };
-                xhr.open('POST', '/ota');
-                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-                xhr.send(file);
+                    };
+                    xhr.open('POST', '/ota');
+                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                    if (otaPass) xhr.setRequestHeader('X-OTA-Password', otaPass);
+                    xhr.send(file);
+                });
             }
 
             function startSpiffsOta() {
@@ -332,44 +396,107 @@
                     return;
                 }
 
+                checkOtaAuth(function(otaPass) {
+                    btn.disabled = true;
+                    progress.style.display = 'block';
+                    progress.value = 0;
+                    status.innerText = 'Uploading storage image...';
+                    status.style.color = '';
+
+                    var xhr = new XMLHttpRequest();
+                    xhr.upload.onprogress = function(e) {
+                        if (e.lengthComputable) {
+                            var pct = Math.round((e.loaded / e.total) * 100);
+                            progress.max = e.total;
+                            progress.value = e.loaded;
+                            status.innerText = 'Uploading... ' + pct + '%';
+                        }
+                    };
+                    xhr.onload = function() {
+                        if (xhr.status === 200) {
+                            status.innerText = 'Update successful! Rebooting...';
+                            status.style.color = '#28a745';
+                            setTimeout(function() {
+                                status.innerText = 'Rebooting... page will reload in 10 seconds.';
+                                setTimeout(function() { window.location.reload(); }, 10000);
+                            }, 2000);
+                        } else {
+                            status.innerText = 'Update failed: ' + xhr.responseText;
+                            status.style.color = '#dc3545';
+                            btn.disabled = false;
+                        }
+                    };
+                    xhr.onerror = function() {
+                        status.innerText = 'Upload failed - connection error';
+                        status.style.color = '#dc3545';
+                        btn.disabled = false;
+                    };
+                    xhr.open('POST', '/ota_spiffs');
+                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                    if (otaPass) xhr.setRequestHeader('X-OTA-Password', otaPass);
+                    xhr.send(file);
+                });
+            }
+
+            function saveOtaPassword() {
+                var btn = document.getElementById('otaPassBtn');
+                var status = document.getElementById('otaPassStatus');
+                var currentPass = document.getElementById('otaPassCurrent').value;
+                var newPass = document.getElementById('otaPassNew').value;
+
                 btn.disabled = true;
-                progress.style.display = 'block';
-                progress.value = 0;
-                status.innerText = 'Uploading storage image...';
+                status.innerText = 'Saving...';
                 status.style.color = '';
 
                 var xhr = new XMLHttpRequest();
-                xhr.upload.onprogress = function(e) {
-                    if (e.lengthComputable) {
-                        var pct = Math.round((e.loaded / e.total) * 100);
-                        progress.max = e.total;
-                        progress.value = e.loaded;
-                        status.innerText = 'Uploading... ' + pct + '%';
-                    }
-                };
                 xhr.onload = function() {
                     if (xhr.status === 200) {
-                        status.innerText = 'Update successful! Rebooting...';
+                        status.innerText = newPass ? 'Password saved' : 'Password removed';
                         status.style.color = '#28a745';
-                        setTimeout(function() {
-                            status.innerText = 'Rebooting... page will reload in 10 seconds.';
-                            setTimeout(function() { window.location.reload(); }, 10000);
-                        }, 2000);
+                        document.getElementById('otaPassCurrent').value = '';
+                        document.getElementById('otaPassNew').value = '';
+                        checkOtaPassword();
                     } else {
-                        status.innerText = 'Update failed: ' + xhr.responseText;
+                        status.innerText = 'Failed: ' + xhr.responseText;
                         status.style.color = '#dc3545';
-                        btn.disabled = false;
                     }
+                    btn.disabled = false;
                 };
                 xhr.onerror = function() {
-                    status.innerText = 'Upload failed - connection error';
+                    status.innerText = 'Connection error';
                     status.style.color = '#dc3545';
                     btn.disabled = false;
                 };
-                xhr.open('POST', '/ota_spiffs');
-                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-                xhr.send(file);
+                xhr.open('POST', '/ota_password');
+                xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+                xhr.send('current=' + encodeURIComponent(currentPass) + '&password=' + encodeURIComponent(newPass));
             }
+
+            function checkOtaPassword() {
+                var xhr = new XMLHttpRequest();
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        try {
+                            var data = JSON.parse(xhr.responseText);
+                            var info = document.getElementById('otaPassInfo');
+                            var currentGroup = document.getElementById('otaPassCurrentGroup');
+                            if (data.hasPassword) {
+                                info.innerText = 'OTA password is set';
+                                info.style.color = '#28a745';
+                                currentGroup.style.display = 'block';
+                            } else {
+                                info.innerText = 'No OTA password set';
+                                info.style.color = '';
+                                currentGroup.style.display = 'none';
+                            }
+                        } catch(e) {}
+                    }
+                };
+                xhr.open('GET', '/ota_password');
+                xhr.send(null);
+            }
+
+            checkOtaPassword();
         </script>
 
     </body>

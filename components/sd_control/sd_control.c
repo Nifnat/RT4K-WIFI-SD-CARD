@@ -106,7 +106,12 @@ esp_err_t sd_control_init(void)
 
 void sd_control_take(void)
 {
-    if (s_we_took_bus) return;
+    xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+
+    if (s_we_took_bus) {
+        xSemaphoreGive(s_sd_mutex);
+        return;
+    }
 
     s_we_took_bus = true;
 
@@ -129,6 +134,7 @@ void sd_control_take(void)
             ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(err));
             s_we_took_bus = false;
             gpio_set_level(PIN_SD_SWITCH, 1);
+            xSemaphoreGive(s_sd_mutex);
             return;
         }
         s_spi_bus_initialized = true;
@@ -162,16 +168,23 @@ void sd_control_take(void)
             ESP_LOGE(TAG, "SD mount failed after retries: %s", esp_err_to_name(err));
             s_we_took_bus = false;
             gpio_set_level(PIN_SD_SWITCH, 1);
+            xSemaphoreGive(s_sd_mutex);
             return;
         }
     }
 
     ESP_LOGD(TAG, "SD card mounted at %s", SD_MOUNT_POINT);
+    xSemaphoreGive(s_sd_mutex);
 }
 
 void sd_control_relinquish(void)
 {
-    if (!s_we_took_bus) return;
+    xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
+
+    if (!s_we_took_bus) {
+        xSemaphoreGive(s_sd_mutex);
+        return;
+    }
 
     /* Unmount SD card */
     if (s_card) {
@@ -203,6 +216,7 @@ void sd_control_relinquish(void)
     s_we_took_bus = false;
 
     ESP_LOGD(TAG, "SD bus relinquished");
+    xSemaphoreGive(s_sd_mutex);
 }
 
 int sd_control_can_take(void)
