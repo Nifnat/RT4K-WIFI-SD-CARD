@@ -558,10 +558,8 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     };
 
-    document.getElementById('updateButton').addEventListener('click', updateList);
+    document.getElementById('updateButton').addEventListener('click', function(e) { e.preventDefault(); updateList(); });
     document.getElementById('uploadButton').addEventListener('click', () => onClickUpload());
-	document.getElementById('modelineButton').addEventListener('click', () => window.location.href = 'video_timings_calculator.htm');
-	document.getElementById('settings').addEventListener('click', () => window.location.href = 'settings.htm');
 });
 
 function updateList() {

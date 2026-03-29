@@ -832,11 +832,17 @@ static esp_err_t handle_static(httpd_req_t *req)
     set_cors_headers(req);
     const char *uri = req->uri;
 
+    /* IP-to-hostname redirect disabled — mDNS doesn't resolve reliably
+     * on SoftAP networks and some client configurations.
+     * Left here for reference if needed in future. */
+#if 0
     /* Redirect IP-based access to mDNS hostname to avoid Chrome PNA blocks.
      * Chrome blocks fetch() from non-secure (HTTP) origins to private IPs,
-     * but allows it when the origin is a .local mDNS hostname. */
+     * but allows it when the origin is a .local mDNS hostname.
+     * Only redirect in STA mode — mDNS won't resolve when client is on SoftAP. */
     char host_buf[64] = "";
-    if (httpd_req_get_hdr_value_str(req, "Host", host_buf, sizeof(host_buf)) == ESP_OK) {
+    if (network_is_sta_mode() &&
+        httpd_req_get_hdr_value_str(req, "Host", host_buf, sizeof(host_buf)) == ESP_OK) {
         if (host_is_ip(host_buf, strlen(host_buf))) {
             char location[600];
             snprintf(location, sizeof(location), "http://rt4ksdcard.local%s", uri);
@@ -846,11 +852,14 @@ static esp_err_t handle_static(httpd_req_t *req)
             return ESP_OK;
         }
     }
+#endif
 
     /* Default to index.htm */
     char path[600];
+    const char *content_type_path = uri;
     if (strcmp(uri, "/") == 0) {
         snprintf(path, sizeof(path), "%s/index.htm", SPIFFS_MOUNT);
+        content_type_path = "/index.htm";
     } else {
         snprintf(path, sizeof(path), "%s%s", SPIFFS_MOUNT, uri);
     }
@@ -875,8 +884,8 @@ static esp_err_t handle_static(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Determine content type from original URI (not gz path) */
-    httpd_resp_set_type(req, get_content_type(uri));
+    /* Determine content type from resolved path (not gz path) */
+    httpd_resp_set_type(req, get_content_type(content_type_path));
     if (is_gz) {
         httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     }

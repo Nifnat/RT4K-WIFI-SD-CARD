@@ -69,6 +69,13 @@ a:hover, a:focus, a.active {
     color: var(--dark-text);
 }
 
+.tm-nav-btn {
+    display: inline-block;
+    text-align: center;
+    text-decoration: none;
+    cursor: pointer;
+}
+
 /* Keep buttons aligned */
 .btn.tm-dd {
     margin: 0 2px;

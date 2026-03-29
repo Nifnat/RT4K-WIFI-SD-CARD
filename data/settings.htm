@@ -24,6 +24,11 @@
             .ota-progress::-webkit-progress-value { background-color: var(--accent-blue); border-radius: 4px; }
             .ota-progress::-moz-progress-bar { background-color: var(--accent-blue); border-radius: 4px; }
             .divider { border: 0; border-top: 1px solid var(--dark-surface-lighter); margin: 0; }
+            .scan-list { list-style: none; padding: 0; margin: 0 0 10px 0; max-height: 200px; overflow-y: auto; }
+            .scan-list li { padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--dark-surface-lighter); display: flex; justify-content: space-between; }
+            .scan-list li:hover { background-color: var(--dark-surface-lighter); }
+            .scan-list .ssid-name { flex: 1; }
+            .scan-list .ssid-info { color: var(--dark-text-secondary); font-size: 14px; margin-left: 10px; }
         </style>
         <script>
             var timeWifiStatus=1;
@@ -113,61 +118,69 @@
                 }
 
             function onHttpWifiList(response) {
-                console.log("onHttpWifiList");
-                
-                var status = document.getElementById('status');
-                var list = "";
-                try {
-                    list = JSON.parse(response);
+                var list = [];
+                try { list = JSON.parse(response); } catch(e) { return; }
+                var scanList = document.getElementById('scanList');
+                scanList.innerHTML = '';
+                if (list.length === 0) {
+                    scanList.innerHTML = '<li>No networks found</li>';
+                    return;
                 }
-                catch(error) {
-                        console.log("Get error response:" + error);
-                        var status = document.getElementById('status');
-                        status.innerText = "Response error, please Scan again.";
+                // Deduplicate by SSID, keeping strongest signal
+                var seen = {};
+                list.forEach(function(item) {
+                    if (!item.ssid) return;
+                    if (!seen[item.ssid] || parseInt(item.rssi) > parseInt(seen[item.ssid].rssi)) {
+                        seen[item.ssid] = item;
                     }
-                var listS = "";
-                for (var i = 0; i < list.length; i++) {
-                    // console.log(list[i].ssid);
-                    // console.log(list[i].rssi);
-                    // console.log(list[i].type);
-                    listS += "SSID:" + list[i].ssid + " , RSSI" + list[i].rssi + " , Type:" + list[i].type + "\n";
-                }
-                
-                status.innerText = listS;
+                });
+                // Sort by signal strength
+                var unique = Object.values(seen).sort(function(a,b) { return parseInt(b.rssi) - parseInt(a.rssi); });
+                unique.forEach(function(item) {
+                    var li = document.createElement('li');
+                    var nameSpan = document.createElement('span');
+                    nameSpan.className = 'ssid-name';
+                    nameSpan.textContent = item.ssid;
+                    var infoSpan = document.createElement('span');
+                    infoSpan.className = 'ssid-info';
+                    infoSpan.textContent = item.rssi + ' dBm' + (item.type === 'open' ? ' (open)' : '');
+                    li.appendChild(nameSpan);
+                    li.appendChild(infoSpan);
+                    li.onclick = function() {
+                        document.getElementById('ssid').value = item.ssid;
+                        document.getElementById('password').focus();
+                    };
+                    scanList.appendChild(li);
+                });
             }
 
             function getWifiList() {
-                xmlHttp = new XMLHttpRequest();
-                xmlHttp.onreadystatechange = function () {
-                    var resp = xmlHttp.responseText;
-                    if (xmlHttp.readyState == 4 && xmlHttp.status == 200) {
-                        onHttpWifiList(xmlHttp.responseText);
-                        console.log("Get response : ");
-                        console.log(xmlHttp.responseText);
+                var xhr = new XMLHttpRequest();
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState == 4 && xhr.status == 200) {
+                        onHttpWifiList(xhr.responseText);
+                        document.getElementById('scanBtn').disabled = false;
+                        document.getElementById('scanBtn').value = 'Scan for Networks';
                     }
                 };
-                xmlHttp.open('GET', '/wifilist', true);
-                xmlHttp.send(null);
+                xhr.open('GET', '/wifilist', true);
+                xhr.send(null);
             }
 
             function onClickScan() {
-                // xmlHttp = new XMLHttpRequest(path);
-                // xmlHttp.open('HTTP_GET', '/wifiscan', true);
-                // xmlHttp.send(null);
-                console.log("onClickScan");
-                var status = document.getElementById('status');
-                status.innerText = "Scanning, please wait ...";
+                var scanBtn = document.getElementById('scanBtn');
+                scanBtn.disabled = true;
+                scanBtn.value = 'Scanning...';
+                document.getElementById('scanList').innerHTML = '';
 
-                xmlHttp = new XMLHttpRequest();
-                xmlHttp.onreadystatechange = function () {
-                    if (xmlHttp.readyState == 4 && xmlHttp.status == 200) {
-                        console.log("Get response : ");
-                        console.log(xmlHttp.responseText);
-                        setTimeout(getWifiList,3000);
+                var xhr = new XMLHttpRequest();
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState == 4 && xhr.status == 200) {
+                        setTimeout(getWifiList, 3000);
                     }
                 };
-                xmlHttp.open('GET', '/wifiscan', true);
-                xmlHttp.send(null);
+                xhr.open('GET', '/wifiscan', true);
+                xhr.send(null);
             }
             
             function onClickAPMode() {
@@ -199,9 +212,11 @@
         <div class="container">
             <h2>WiFi Settings</h2>
             <form class="form-horizontal" role="form">
+                <input class="btn" type="button" id="scanBtn" value="Scan for Networks" onclick="onClickScan()" />
+                <ul id="scanList" class="scan-list"></ul>
                 <div class="form-group">
                     <label>SSID</label>
-                    <input id="ssid" type="text" name="ssid">
+                    <input id="ssid" type="text" name="ssid" placeholder="Select from scan or type manually">
                 </div>
                 <div class="form-group">
                     <label>Password</label>
