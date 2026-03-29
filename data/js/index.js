@@ -371,19 +371,34 @@ function onClickUpload(uploadPath = currentPath) {
     const encodedPath = encodeURIComponent(uploadPath);
     const uploadUrl = `/upload?path=${encodedPath}`;
 
-    fetch(uploadUrl, {
-        method: 'POST',
-        body: formData,
-    })
-    .then(response => response.text())
-    .then(data => {
-        alert('Upload successful!');
-        fetchDirectory(currentPath);
-    })
-    .catch(error => {
-        console.error('Error uploading file:', error);
+    document.getElementById('probar').style.display = 'block';
+    document.getElementById('uploadButton').disabled = true;
+
+    var xhr = new XMLHttpRequest();
+    xhr.upload.onprogress = function(evt) {
+        if (evt.lengthComputable) {
+            var progressBar = document.getElementById('progressbar');
+            progressBar.max = evt.total;
+            progressBar.value = evt.loaded;
+        }
+    };
+    xhr.onload = function() {
+        document.getElementById('probar').style.display = 'none';
+        document.getElementById('uploadButton').disabled = false;
+        if (xhr.status === 200) {
+            alert('Upload successful!');
+            fetchDirectory(currentPath);
+        } else {
+            alert('Upload failed: ' + xhr.responseText);
+        }
+    };
+    xhr.onerror = function() {
+        document.getElementById('probar').style.display = 'none';
+        document.getElementById('uploadButton').disabled = false;
         alert('Upload failed.');
-    });
+    };
+    xhr.open('POST', uploadUrl);
+    xhr.send(formData);
 }
 
 function onClickRename(fullPath, currentName) {
@@ -443,6 +458,56 @@ function isTextFile(filename) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+    // SD access toggle
+    const sdToggle = document.getElementById('sdAccessToggle');
+    const sdLabel = document.getElementById('sdAccessLabel');
+
+    function updateSdLabel(enabled) {
+        sdLabel.textContent = enabled ? 'SD Access: On' : 'SD Access: Off';
+        sdLabel.style.color = enabled ? '#28a745' : '';
+    }
+
+    // Check initial state
+    fetch('/sd_access')
+        .then(r => r.json())
+        .then(data => {
+            sdToggle.checked = data.enabled;
+            updateSdLabel(data.enabled);
+            if (data.enabled) {
+                fetchDirectory('/');
+            }
+        })
+        .catch(() => {});
+
+    sdToggle.addEventListener('change', function() {
+        const enable = sdToggle.checked;
+        fetch('/sd_access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'enable=' + (enable ? '1' : '0')
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                sdToggle.checked = !enable; // revert
+                alert('SD access error: ' + data.error);
+                return;
+            }
+            sdToggle.checked = data.enabled;
+            updateSdLabel(data.enabled);
+            if (data.enabled) {
+                fetchDirectory('/');
+            } else {
+                document.getElementById('filelistbox').innerHTML =
+                    '<p style="padding:10px;color:#888;">SD access disabled — enable to browse files.</p>';
+            }
+        })
+        .catch(err => {
+            sdToggle.checked = !enable; // revert
+            alert('Failed to toggle SD access: ' + err.message);
+        });
+    });
+
     // Initialize Monaco Editor
     require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' }});
     require(['vs/editor/editor.main'], function() {
@@ -478,7 +543,9 @@ document.addEventListener('DOMContentLoaded', function() {
 		});
 	});
 
-    fetchDirectory('/');
+    // Don't auto-fetch — the sd_access check above will fetchDirectory if enabled
+    document.getElementById('filelistbox').innerHTML =
+        '<p style="padding:10px;color:#888;">SD access disabled — enable to browse files.</p>';
 
     document.querySelector('.close').addEventListener('click', closeEditor);
     
@@ -494,7 +561,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('updateButton').addEventListener('click', updateList);
     document.getElementById('uploadButton').addEventListener('click', () => onClickUpload());
 	document.getElementById('modelineButton').addEventListener('click', () => window.location.href = 'video_timings_calculator.htm');
-	document.getElementById('settings').addEventListener('click', () => window.location.href = 'wifi.htm');
+	document.getElementById('settings').addEventListener('click', () => window.location.href = 'settings.htm');
 });
 
 function updateList() {

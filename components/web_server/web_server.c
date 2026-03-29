@@ -13,6 +13,9 @@
 #include "esp_http_server.h"
 #include "esp_vfs.h"
 #include "esp_spiffs.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_partition.h"
 
 static const char *TAG = "webserver";
 static httpd_handle_t s_server = NULL;
@@ -899,6 +902,276 @@ static esp_err_t handle_static(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ─── /sd_access ──────────────────────────────────────────────────── */
+
+static esp_err_t handle_sd_access_get(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"enabled\":%s}",
+             sd_control_is_access_enabled() ? "true" : "false");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static esp_err_t handle_sd_access_post(httpd_req_t *req)
+{
+    set_cors_headers(req);
+
+    char *body = NULL;
+    if (read_post_body(req, &body) < 0) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "Missing body");
+        return ESP_OK;
+    }
+
+    char enable_str[8] = "";
+    parse_form_field(body, "enable", enable_str, sizeof(enable_str));
+    free(body);
+
+    bool enable = (strcmp(enable_str, "1") == 0 || strcmp(enable_str, "true") == 0);
+    esp_err_t err = sd_control_set_access(enable);
+
+    if (err == ESP_OK) {
+        char resp[64];
+        snprintf(resp, sizeof(resp), "{\"enabled\":%s}",
+                 sd_control_is_access_enabled() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, resp);
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409");
+        httpd_resp_sendstr(req, "{\"error\":\"RT4K may be using SD card\"}");
+    } else {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "{\"error\":\"Failed to mount SD card\"}");
+    }
+
+    return ESP_OK;
+}
+
+/* ─── /ota ─────────────────────────────────────────────────────────── */
+
+static esp_err_t handle_ota(httpd_req_t *req)
+{
+    set_cors_headers(req);
+
+    int content_len = req->content_len;
+    if (content_len <= 0) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "No firmware data");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "OTA update starting, firmware size: %d bytes", content_len);
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (!update_partition) {
+        ESP_LOGE(TAG, "OTA: no update partition found");
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "No OTA partition available");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "OTA: writing to partition '%s' at offset 0x%"PRIx32,
+             update_partition->label, update_partition->address);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "OTA begin failed");
+        return ESP_OK;
+    }
+
+    char *buf = malloc(FILE_BUF_SIZE);
+    if (!buf) {
+        esp_ota_abort(ota_handle);
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Out of memory");
+        return ESP_OK;
+    }
+
+    int remaining = content_len;
+    int received_total = 0;
+    bool failed = false;
+
+    while (remaining > 0) {
+        int to_recv = remaining < FILE_BUF_SIZE ? remaining : FILE_BUF_SIZE;
+        int received = httpd_req_recv(req, buf, to_recv);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue; /* Retry on timeout */
+            }
+            ESP_LOGE(TAG, "OTA: recv error");
+            failed = true;
+            break;
+        }
+
+        err = esp_ota_write(ota_handle, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA write failed: %s", esp_err_to_name(err));
+            failed = true;
+            break;
+        }
+
+        received_total += received;
+        remaining -= received;
+
+        /* Log progress every ~100KB */
+        if (received_total % (100 * 1024) < FILE_BUF_SIZE) {
+            ESP_LOGI(TAG, "OTA: %d / %d bytes (%d%%)",
+                     received_total, content_len,
+                     (int)((int64_t)received_total * 100 / content_len));
+        }
+    }
+
+    free(buf);
+
+    if (failed) {
+        esp_ota_abort(ota_handle);
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "OTA receive/write failed");
+        return ESP_OK;
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA end failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500");
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+            httpd_resp_sendstr(req, "Firmware validation failed - bad image");
+        } else {
+            httpd_resp_sendstr(req, "OTA finalize failed");
+        }
+        return ESP_OK;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA set boot partition failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Failed to set boot partition");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "OTA update successful! Rebooting in 2 seconds...");
+    httpd_resp_sendstr(req, "OK");
+
+    /* Delay then reboot so the response gets sent */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+
+    return ESP_OK; /* Never reached */
+}
+
+/* ─── /ota_spiffs ─────────────────────────────────────────────────── */
+
+static esp_err_t handle_ota_spiffs(httpd_req_t *req)
+{
+    set_cors_headers(req);
+
+    int content_len = req->content_len;
+    if (content_len <= 0) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "No SPIFFS data");
+        return ESP_OK;
+    }
+
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (!part) {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "SPIFFS partition not found");
+        return ESP_OK;
+    }
+
+    if ((size_t)content_len > part->size) {
+        httpd_resp_set_status(req, "400");
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Image too large (%d > %"PRIu32")", content_len, part->size);
+        httpd_resp_sendstr(req, msg);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "SPIFFS update: %d bytes -> partition '%s'", content_len, part->label);
+
+    /* Unmount SPIFFS so we can write to the partition */
+    esp_vfs_spiffs_unregister("storage");
+    ESP_LOGI(TAG, "SPIFFS unmounted");
+
+    /* Erase the partition */
+    esp_err_t err = esp_partition_erase_range(part, 0, part->size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS erase failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Partition erase failed");
+        esp_restart();
+        return ESP_OK;
+    }
+
+    char *buf = malloc(FILE_BUF_SIZE);
+    if (!buf) {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Out of memory");
+        esp_restart();
+        return ESP_OK;
+    }
+
+    int remaining = content_len;
+    size_t offset = 0;
+    bool failed = false;
+
+    while (remaining > 0) {
+        int to_recv = remaining < FILE_BUF_SIZE ? remaining : FILE_BUF_SIZE;
+        int received = httpd_req_recv(req, buf, to_recv);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "SPIFFS OTA: recv error");
+            failed = true;
+            break;
+        }
+
+        err = esp_partition_write(part, offset, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "SPIFFS write failed at offset %u: %s", offset, esp_err_to_name(err));
+            failed = true;
+            break;
+        }
+
+        offset += received;
+        remaining -= received;
+
+        if (offset % (100 * 1024) < FILE_BUF_SIZE) {
+            ESP_LOGI(TAG, "SPIFFS OTA: %u / %d bytes (%d%%)",
+                     offset, content_len,
+                     (int)((int64_t)offset * 100 / content_len));
+        }
+    }
+
+    free(buf);
+
+    if (failed) {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "SPIFFS write failed");
+        ESP_LOGW(TAG, "SPIFFS write failed, rebooting to remount...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "SPIFFS update complete! Rebooting...");
+    httpd_resp_sendstr(req, "OK");
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+
+    return ESP_OK;
+}
+
 /* ─── OPTIONS preflight handler (Chrome Private Network Access) ──── */
 
 static esp_err_t handle_options(httpd_req_t *req)
@@ -916,7 +1189,7 @@ static esp_err_t handle_options(httpd_req_t *req)
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 22;
     config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.recv_wait_timeout = 30;  /* 30s for large uploads */
@@ -931,6 +1204,8 @@ esp_err_t web_server_start(void)
     /* Register URI handlers — order matters for wildcard matching */
     const httpd_uri_t uris[] = {
         { .uri = "/relinquish", .method = HTTP_GET,  .handler = handle_relinquish },
+        { .uri = "/sd_access",  .method = HTTP_GET,  .handler = handle_sd_access_get },
+        { .uri = "/sd_access",  .method = HTTP_POST, .handler = handle_sd_access_post },
         { .uri = "/list",       .method = HTTP_GET,  .handler = handle_list },
         { .uri = "/download",   .method = HTTP_GET,  .handler = handle_download },
         { .uri = "/delete",     .method = HTTP_GET,  .handler = handle_delete },
@@ -942,6 +1217,8 @@ esp_err_t web_server_start(void)
         { .uri = "/wifistatus", .method = HTTP_GET,  .handler = handle_wifi_status },
         { .uri = "/wifiscan",   .method = HTTP_GET,  .handler = handle_wifi_scan },
         { .uri = "/wifilist",   .method = HTTP_GET,  .handler = handle_wifi_list },
+        { .uri = "/ota",        .method = HTTP_POST, .handler = handle_ota },
+        { .uri = "/ota_spiffs", .method = HTTP_POST, .handler = handle_ota_spiffs },
         { .uri = "/*",          .method = HTTP_GET,     .handler = handle_static },
         { .uri = "/*",          .method = HTTP_OPTIONS, .handler = handle_options },
     };

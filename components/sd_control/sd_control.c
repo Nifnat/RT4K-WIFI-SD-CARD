@@ -8,6 +8,8 @@
 #include "driver/spi_common.h"
 #include "driver/gpio.h"
 #include "sdmmc_cmd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "pins.h"
 
@@ -19,12 +21,19 @@ static const char *TAG = "sd_ctrl";
 /* State */
 static volatile int64_t s_blockout_time_us = 0;
 static bool s_we_took_bus = false;
+static bool s_access_enabled = false;
+
+/* Mutex to prevent concurrent SD operations from multiple HTTP handlers */
+static SemaphoreHandle_t s_sd_mutex = NULL;
 
 /* SPI bus and card handles for mount/unmount */
 static sdmmc_card_t *s_card = NULL;
 static bool s_spi_bus_initialized = false;
 
-/* ISR: Fires when RT4K asserts/deasserts CS on the SD card */
+/* ISR: Fires when RT4K asserts/deasserts CS on the SD card.
+ * Note: This only works if RT4K uses 4-bit SD mode (DAT3 toggles).
+ * In 1-bit mode DAT3 is unused, so this ISR won't fire — the manual
+ * access toggle in the web UI is the primary gating mechanism. */
 static void IRAM_ATTR cs_sense_isr(void *arg)
 {
     if (!s_we_took_bus) {
@@ -36,6 +45,12 @@ static void IRAM_ATTR cs_sense_isr(void *arg)
 
 esp_err_t sd_control_init(void)
 {
+    s_sd_mutex = xSemaphoreCreateMutex();
+    if (!s_sd_mutex) {
+        ESP_LOGE(TAG, "Failed to create SD mutex");
+        return ESP_FAIL;
+    }
+
     /* Configure SD switch pin (mux control) */
     gpio_config_t sw_cfg = {
         .pin_bit_mask = (1ULL << PIN_SD_SWITCH),
@@ -70,7 +85,7 @@ esp_err_t sd_control_init(void)
     gpio_install_isr_service(0);
     gpio_isr_handler_add(PIN_CS_SENSE, cs_sense_isr, NULL);
 
-    /* Default: mux to RT4K, power on */
+    /* Default: mux to RT4K, power on, access disabled */
     gpio_set_level(PIN_SD_SWITCH, 1);
     gpio_set_level(PIN_SD_POWER, 0);
 
@@ -83,6 +98,8 @@ esp_err_t sd_control_init(void)
         ESP_LOGI(TAG, "Waiting for RT4K to assert SD card... (%d/%d)",
                  i + 1, SPI_BLOCKOUT_BOOTUP_PERIOD_S);
     }
+
+    ESP_LOGI(TAG, "SD access disabled by default — enable via web UI");
 
     return ESP_OK;
 }
@@ -190,8 +207,15 @@ void sd_control_relinquish(void)
 
 int sd_control_can_take(void)
 {
+    /* Primary gate: access must be enabled via web UI */
+    if (!s_access_enabled) {
+        return -1;
+    }
+
+    /* If we already hold the bus, allow (re-entrant from same enable session) */
     if (s_we_took_bus) return 0;
 
+    /* Secondary check: CS_SENSE blockout (works if RT4K uses 4-bit mode) */
     int64_t now = esp_timer_get_time();
     if (now < s_blockout_time_us) {
         ESP_LOGD(TAG, "Blocked: %" PRId64 " us remaining",
@@ -204,4 +228,34 @@ int sd_control_can_take(void)
 bool sd_control_we_have_control(void)
 {
     return s_we_took_bus;
+}
+
+esp_err_t sd_control_set_access(bool enabled)
+{
+    if (enabled == s_access_enabled) {
+        return ESP_OK;
+    }
+
+    if (enabled) {
+        /* Check CS_SENSE blockout before enabling */
+        int64_t now = esp_timer_get_time();
+        if (now < s_blockout_time_us) {
+            ESP_LOGW(TAG, "Cannot enable: RT4K may be using SD card");
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        s_access_enabled = true;
+        ESP_LOGI(TAG, "SD access enabled — per-request bus sharing active");
+    } else {
+        s_access_enabled = false;
+        sd_control_relinquish();
+        ESP_LOGI(TAG, "SD access disabled — bus released to RT4K");
+    }
+
+    return ESP_OK;
+}
+
+bool sd_control_is_access_enabled(void)
+{
+    return s_access_enabled;
 }

@@ -26,10 +26,35 @@
             });
     }
 </script>
+<style>
+    :root { --dark-bg: #1e1e1e; --dark-surface: #2d2d2d; --dark-surface-lighter: #363636; --dark-text: #e0e0e0; --dark-text-secondary: #b0b0b0; --accent-blue: #689bd0; --accent-blue-hover: #58d5ff; }
+    body { background-color: var(--dark-bg); color: var(--dark-text); font-family: 'Open Sans', Helvetica, Arial, sans-serif; margin: 10px; }
+    a { color: var(--accent-blue); }
+    a:hover { color: var(--accent-blue-hover); }
+    h1, h2 { color: var(--dark-text); }
+    table { border-collapse: collapse; }
+    td, th { padding: 4px 8px; border: 1px solid var(--dark-surface-lighter); }
+    input[type="text"], select { background-color: var(--dark-surface-lighter); color: var(--dark-text); border: 1px solid #555; padding: 3px 6px; }
+    button { background-color: var(--dark-surface-lighter); color: var(--dark-text); border: 1px solid #555; padding: 4px 10px; cursor: pointer; border-radius: 3px; }
+    button:hover { background-color: var(--accent-blue); border-color: var(--accent-blue); }
+    code { color: #ccc; }
+    label { color: var(--dark-text); }
+    ul { color: var(--dark-text-secondary); }
+    .nav-bar { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; }
+    .nav-bar a.button { background-color: var(--dark-surface-lighter); color: var(--dark-text); padding: 6px 14px; border-radius: 4px; text-decoration: none; border: 1px solid #555; }
+    .nav-bar a.button:hover { background-color: var(--accent-blue); border-color: var(--accent-blue); }
+    .sd-toggle { display: inline-flex; align-items: center; cursor: pointer; color: var(--dark-text); }
+    .sd-toggle input { margin-right: 5px; }
+</style>
+
 <h1>RetroTINK 4K Video Timings Calculator</h1>
 
-<div class="nav-button">
-    <a href="/index.htm" class="button">Back File Editor</a>
+<div class="nav-bar">
+    <a href="/index.htm" class="button">Back to File Editor</a>
+    <label class="sd-toggle">
+        <input type="checkbox" id="sdAccessToggle">
+        <span id="sdAccessLabel">SD Access: Off</span>
+    </label>
 </div>
 <div class="description">
     A simplified RT4K derivative of <a href="https://tomverbeure.github.io/video_timings_calculator">Tom Verbeure's
@@ -105,8 +130,8 @@
 <h2>Timings</h2>
 <div style="display: flex; margin-top: 20px;">
     <form id="timings">
-        <table cellspacing="1" bgcolor="#202020">
-            <tr bgcolor=#ffffff>
+        <table cellspacing="1" style="background-color: var(--dark-surface);">
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <th></th>
                 <th>CVT</th>
                 <th>CVT-RB</th>
@@ -116,7 +141,7 @@
                 <th>Custom</th>
                 <th colspan=2></th>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>Aspect Ratio</label></td>
                 <td><label id="cvt-aspect_ratio"></label></td>
                 <td><label id="cvt_rb-aspect_ratio"></label></td>
@@ -126,7 +151,7 @@
                 <td><label id="custom-aspect_ratio"></label></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>Pixel Clock</label></td>
                 <td><label id="cvt-pclock"></label></td>
                 <td><label id="cvt_rb-pclock"></label></td>
@@ -136,7 +161,7 @@
                 <td><label id="custom-pclock"></label></td>
                 <td colspan=2><label>MHz</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Total</label></td>
                 <td><label id="cvt-htotal"></label></td>
                 <td><label id="cvt_rb-htotal"></label></td>
@@ -146,7 +171,7 @@
                 <td><label id="custom-htotal"></label></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Active</label></td>
                 <td><label id="cvt-hpixels"></label></td>
                 <td><label id="cvt_rb-hpixels"></label></td>
@@ -156,7 +181,7 @@
                 <td><label id="custom-hpixels"></label></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Blank</label></td>
                 <td><label id="cvt-hblank"></label></td>
                 <td><label id="cvt_rb-hblank"></label></td>
@@ -166,7 +191,7 @@
                 <td><input id="custom-hblank" type="text" value="80" size="6" /></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Front Porch</label></td>
                 <td><label id="cvt-hfront"></label></td>
                 <td><label id="cvt_rb-hfront"></label></td>
@@ -176,7 +201,7 @@
                 <td></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Sync</label></td>
                 <td><label id="cvt-hsync"></label></td>
                 <td><label id="cvt_rb-hsync"></label></td>
@@ -186,7 +211,7 @@
                 <td></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Back Porch</label></td>
                 <td><label id="cvt-hback"></label></td>
                 <td><label id="cvt_rb-hback"></label></td>
@@ -196,7 +221,7 @@
                 <td></td>
                 <td colspan=2><label>Pixels</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Sync Polarity</label></td>
                 <td><label id="cvt-hpol"></label></td>
                 <td><label id="cvt_rb-hpol"></label></td>
@@ -206,7 +231,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Freq</label></td>
                 <td><label id="cvt-hfreq"></label></td>
                 <td><label id="cvt_rb-hfreq"></label></td>
@@ -216,7 +241,7 @@
                 <td><label id="custom-hfreq"></label></td>
                 <td colspan=2><label>kHz</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>H Period</label></td>
                 <td><label id="cvt-hperiod"></label></td>
                 <td><label id="cvt_rb-hperiod"></label></td>
@@ -227,7 +252,7 @@
                 <td colspan=2><label>us</label></td>
             </tr>
 
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Total</label></td>
                 <td><label id="cvt-vtotal"></label></td>
                 <td><label id="cvt_rb-vtotal"></label></td>
@@ -237,7 +262,7 @@
                 <td><label id="custom-vtotal"></label></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Active</label></td>
                 <td><label id="cvt-vpixels"></label></td>
                 <td><label id="cvt_rb-vpixels"></label></td>
@@ -247,7 +272,7 @@
                 <td><label id="custom-vpixels"></label></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Blank</label></td>
                 <td><label id="cvt-vblank"></label></td>
                 <td><label id="cvt_rb-vblank"></label></td>
@@ -257,7 +282,7 @@
                 <td><input id="custom-vblank" type="text" value="6" size="6" /></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Blank Duration</label></td>
                 <td><label id="cvt-vblank_duration"></label></td>
                 <td><label id="cvt_rb-vblank_duration"></label></td>
@@ -267,7 +292,7 @@
                 <td><label id="custom-vblank_duration"></label></td>
                 <td colspan=2><label>us</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Front Porch</label></td>
                 <td><label id="cvt-vfront"></label></td>
                 <td><label id="cvt_rb-vfront"></label></td>
@@ -277,7 +302,7 @@
                 <td></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Sync</label></td>
                 <td><label id="cvt-vsync"></label></td>
                 <td><label id="cvt_rb-vsync"></label></td>
@@ -287,7 +312,7 @@
                 <td></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Back Porch</label></td>
                 <td><label id="cvt-vback"></label></td>
                 <td><label id="cvt_rb-vback"></label></td>
@@ -297,7 +322,7 @@
                 <td></td>
                 <td colspan=2><label>Lines</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Sync Polarity</label></td>
                 <td><label id="cvt-vpol"></label></td>
                 <td><label id="cvt_rb-vpol"></label></td>
@@ -307,7 +332,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Freq</label></td>
                 <td><label id="cvt-vfreq"></label></td>
                 <td><label id="cvt_rb-vfreq"></label></td>
@@ -317,7 +342,7 @@
                 <td><label id="custom-vfreq"></label></td>
                 <td colspan=2><label>Hz</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>V Period</label></td>
                 <td><label id="cvt-vperiod"></label></td>
                 <td><label id="cvt_rb-vperiod"></label></td>
@@ -327,7 +352,7 @@
                 <td><label id="custom-vperiod"></label></td>
                 <td colspan=2><label>ms</label></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>Peak BW (10/8)</label></td>
                 <td><label id="cvt-peak_bw"></label></td>
                 <td><label id="cvt_rb-peak_bw"></label></td>
@@ -337,7 +362,7 @@
                 <td><label id="custom-peak_bw"></label></td>
                 <td colspan=2><label>Gbps</label></td>
             </tr>
-            <!--<tr bgcolor=#ffffff>
+            <!--<tr style="background-color: var(--dark-surface-lighter);">
                     <td><label>Line BW</label></td>
                     <td><label id="cvt-line_bw"></label></td>
                     <td><label id="cvt_rb-line_bw"></label></td>
@@ -347,7 +372,7 @@
                     <td><label id="custom-line_bw"></label></td>
                     <td colspan=2><label>Mbit/s</label></td>
                 </tr>
-                <tr bgcolor=#ffffff>
+                <tr style="background-color: var(--dark-surface-lighter);">
                     <td><label>Active BW</label></td>
                     <td><label id="cvt-active_bw"></label></td>
                     <td><label id="cvt_rb-active_bw"></label></td>
@@ -357,7 +382,7 @@
                     <td><label id="custom-active_bw"></label></td>
                     <td colspan=2><label>Mbit/s</label></td>
                 </tr>-->
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>DMT ID</label></td>
                 <td />
                 <td />
@@ -367,7 +392,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>DMT timing standard</label></td>
                 <td />
                 <td />
@@ -377,7 +402,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>Std 2-byte code</label></td>
                 <td />
                 <td />
@@ -387,7 +412,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>CVT 3-byte code</label></td>
                 <td />
                 <td />
@@ -397,7 +422,7 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>VIC</label></td>
                 <td />
                 <td />
@@ -407,11 +432,11 @@
                 <td></td>
                 <td colspan=2></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td colspan=8><b>RT4K Custom Modelines</b></td>
                 <td><b>Set RT4K Modeline</b></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>CVT</td>
                 <td colspan=7><code><label id="cvt-modeline"></label></code></td>
                 <td>
@@ -421,7 +446,7 @@
                     <button type="button" onclick="setModeline('cvt-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>CVT-RB</td>
                 <td colspan=7><code><label id="cvt_rb-modeline"></label></code></td>
                 <td>
@@ -431,7 +456,7 @@
                     <button type="button" onclick="setModeline('cvt_rb-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>CVT-RBv2</td>
                 <td colspan=7><code><label id="cvt_rb2-modeline"></label></code></td>
                 <td>
@@ -441,7 +466,7 @@
                     <button type="button" onclick="setModeline('cvt_rb2-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>CEA-861</td>
                 <td colspan=7><code><label id="cea-modeline"></label></code></td>
                 <td>
@@ -451,7 +476,7 @@
                     <button type="button" onclick="setModeline('cea-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>DMT</td>
                 <td colspan=7><code><label id="dmt-modeline"></label></code></td>
                 <td>
@@ -461,7 +486,7 @@
                     <button type="button" onclick="setModeline('dmt-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>Custom</td>
                 <td colspan=7><code><label id="custom-modeline"></label></code></td>
                 <td>
@@ -471,10 +496,10 @@
                     <button type="button" onclick="setModeline('custom-modeline', 4)">4</button>
                 </td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td colspan=9><b>HDMI 2.0 (bandwidth)</b></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td><label>RT4K (600 MHz)</label></td>
                 <td><label id="cvt-hdmi_2_0"></label></td>
                 <td><label id="cvt_rb-hdmi_2_0"></label></td>
@@ -489,24 +514,24 @@
     <div style="margin-left: 20px; margin-top: 580px;">
         <h2>Stored Modelines</h2>
         <button type="button" onclick="readModelines()" style="margin-bottom: 10px;">Read Modelines</button>
-        <table id="modelinesTable" cellspacing="1" bgcolor="#202020" style="display: none;">
-            <tr bgcolor=#ffffff>
+        <table id="modelinesTable" cellspacing="1" style="background-color: var(--dark-surface); display: none;">
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <th>Slot</th>
                 <th>Content</th>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>1</td>
                 <td><code id="modeline1"></code></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>2</td>
                 <td><code id="modeline2"></code></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>3</td>
                 <td><code id="modeline3"></code></td>
             </tr>
-            <tr bgcolor=#ffffff>
+            <tr style="background-color: var(--dark-surface-lighter);">
                 <td>4</td>
                 <td><code id="modeline4"></code></td>
             </tr>
@@ -557,5 +582,31 @@
                 });
         }
     }
+
+    // SD Access Toggle
+    (function() {
+        var sdToggle = document.getElementById('sdAccessToggle');
+        var sdLabel = document.getElementById('sdAccessLabel');
+        function updateLabel(enabled) {
+            sdLabel.textContent = enabled ? 'SD Access: On' : 'SD Access: Off';
+            sdLabel.style.color = enabled ? '#28a745' : '';
+        }
+        fetch('/sd_access').then(function(r){return r.json();}).then(function(data){
+            sdToggle.checked = data.enabled;
+            updateLabel(data.enabled);
+        }).catch(function(){});
+        sdToggle.addEventListener('change', function() {
+            var enable = sdToggle.checked;
+            fetch('/sd_access', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'enable=' + (enable ? '1' : '0')
+            }).then(function(r){return r.json();}).then(function(data){
+                if (data.error) { sdToggle.checked = !enable; alert('SD access error: ' + data.error); return; }
+                sdToggle.checked = data.enabled;
+                updateLabel(data.enabled);
+            }).catch(function(err){ sdToggle.checked = !enable; alert('Failed: ' + err.message); });
+        });
+    })();
 
 </script>
