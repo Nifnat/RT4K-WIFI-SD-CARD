@@ -1,0 +1,328 @@
+#include "network.h"
+#include "rt4k_config.h"
+
+#include <string.h>
+#include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "mdns.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+
+static const char *TAG = "network";
+
+/* Event group bits */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static EventGroupHandle_t s_wifi_event_group;
+static esp_netif_t *s_sta_netif = NULL;
+static esp_netif_t *s_ap_netif = NULL;
+
+static net_status_t s_status = NET_STATUS_DISCONNECTED;
+static bool s_sta_mode = false;
+static char s_ip_str[16] = "";
+
+/* Scan results cache */
+static wifi_ap_record_t s_scan_results[20];
+static uint16_t s_scan_count = 0;
+static bool s_scan_done = false;
+
+/* Pending connection request from web UI */
+static bool s_connect_pending = false;
+static char s_pending_ssid[32];
+static char s_pending_pass[64];
+
+static int s_retry_count = 0;
+#define MAX_RETRIES 10
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+        case WIFI_EVENT_STA_START:
+            esp_wifi_connect();
+            break;
+
+        case WIFI_EVENT_STA_DISCONNECTED:
+            s_status = NET_STATUS_DISCONNECTED;
+            s_ip_str[0] = '\0';
+            if (s_retry_count < MAX_RETRIES) {
+                s_retry_count++;
+                ESP_LOGI(TAG, "Retry WiFi connection (%d/%d)", s_retry_count, MAX_RETRIES);
+                esp_wifi_connect();
+            } else {
+                ESP_LOGW(TAG, "WiFi connection failed after %d retries", MAX_RETRIES);
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            }
+            break;
+
+        case WIFI_EVENT_SCAN_DONE:
+            s_scan_count = sizeof(s_scan_results) / sizeof(s_scan_results[0]);
+            esp_wifi_scan_get_ap_records(&s_scan_count, s_scan_results);
+            s_scan_done = true;
+            ESP_LOGI(TAG, "Scan complete: %d networks found", s_scan_count);
+            break;
+
+        case WIFI_EVENT_AP_STACONNECTED: {
+            wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+            ESP_LOGI(TAG, "Station connected to AP, AID=%d", event->aid);
+            break;
+        }
+
+        default:
+            break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Connected - IP: %s", s_ip_str);
+        s_status = NET_STATUS_CONNECTED;
+        s_retry_count = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void start_mdns(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mDNS init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set("rt4ksdcard");
+    mdns_instance_name_set("RT4K SD Card WiFi");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS started: rt4ksdcard.local");
+}
+
+esp_err_t network_init(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    return ESP_OK;
+}
+
+void network_start(void)
+{
+    rt4k_wifi_config_t cfg;
+
+    if (!rt4k_config_load(&cfg)) {
+        ESP_LOGW(TAG, "No valid WiFi config, starting SoftAP");
+        network_start_softap();
+        return;
+    }
+
+    s_status = NET_STATUS_CONNECTING;
+    s_sta_mode = true;
+    s_retry_count = 0;
+
+    wifi_config_t wifi_cfg = {};
+    strncpy((char *)wifi_cfg.sta.ssid, cfg.ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, cfg.password, sizeof(wifi_cfg.sta.password) - 1);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Connecting to %s...", cfg.ssid);
+
+    /* Wait for connection or failure */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(NET_CONNECT_TIMEOUT_MS));
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Connected to %s, IP: %s", cfg.ssid, s_ip_str);
+        rt4k_config_save(cfg.ssid, cfg.password);
+
+        /* Set minimum modem power save */
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+        start_mdns();
+    } else {
+        ESP_LOGW(TAG, "Connection failed, starting SoftAP");
+        esp_wifi_stop();
+        rt4k_config_clear();
+        network_start_softap();
+    }
+}
+
+void network_start_softap(void)
+{
+    s_sta_mode = false;
+    s_status = NET_STATUS_DISCONNECTED;
+
+    /* Configure AP netif with static IP */
+    esp_netif_ip_info_t ip_info;
+    esp_netif_str_to_ip4(NET_AP_IP, &ip_info.ip);
+    esp_netif_str_to_ip4(NET_AP_GW, &ip_info.gw);
+    esp_netif_str_to_ip4(NET_AP_NETMASK, &ip_info.netmask);
+
+    esp_netif_dhcps_stop(s_ap_netif);
+    esp_netif_set_ip_info(s_ap_netif, &ip_info);
+    esp_netif_dhcps_start(s_ap_netif);
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = NET_AP_SSID,
+            .ssid_len = strlen(NET_AP_SSID),
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = 4,
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "SoftAP started: %s (IP: %s)", NET_AP_SSID, NET_AP_IP);
+
+    start_mdns();
+}
+
+bool network_connect(const char *ssid, const char *password)
+{
+    if (!ssid || !password) return false;
+
+    /* If already connected to this SSID, skip */
+    if (s_status == NET_STATUS_CONNECTED && s_sta_mode) {
+        wifi_config_t current;
+        esp_wifi_get_config(WIFI_IF_STA, &current);
+        if (strcmp((char *)current.sta.ssid, ssid) == 0) {
+            return false; /* Already connected */
+        }
+    }
+
+    s_status = NET_STATUS_CONNECTING;
+    s_retry_count = 0;
+
+    wifi_config_t wifi_cfg = {};
+    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+
+    /* Use AP+STA so the config page remains accessible during connection */
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+
+    /* Configure AP side to keep captive portal accessible */
+    esp_netif_ip_info_t ip_info;
+    esp_netif_str_to_ip4(NET_AP_IP, &ip_info.ip);
+    esp_netif_str_to_ip4(NET_AP_GW, &ip_info.gw);
+    esp_netif_str_to_ip4(NET_AP_NETMASK, &ip_info.netmask);
+    esp_netif_dhcps_stop(s_ap_netif);
+    esp_netif_set_ip_info(s_ap_netif, &ip_info);
+    esp_netif_dhcps_start(s_ap_netif);
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = NET_AP_SSID,
+            .ssid_len = strlen(NET_AP_SSID),
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = 4,
+        },
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    esp_wifi_connect();
+
+    /* Wait for result in background — the event handler updates status */
+    ESP_LOGI(TAG, "Connecting to %s...", ssid);
+
+    /* Save creds optimistically — cleared on failure by event handler path */
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    strncpy(s_pending_pass, password, sizeof(s_pending_pass) - 1);
+    s_connect_pending = true;
+    s_sta_mode = true;
+
+    /* Wait for connection result (blocking) */
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdTRUE, pdFALSE,
+        pdMS_TO_TICKS(NET_CONNECT_TIMEOUT_MS));
+
+    s_connect_pending = false;
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        rt4k_config_save(ssid, password);
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        start_mdns();
+        return true;
+    }
+
+    return true; /* Connection attempt was started, even if it may fail later */
+}
+
+void network_start_scan(void)
+{
+    s_scan_done = false;
+    s_scan_count = 0;
+
+    wifi_scan_config_t scan_cfg = {
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    esp_wifi_scan_start(&scan_cfg, false);
+    ESP_LOGI(TAG, "WiFi scan started");
+}
+
+int network_get_scan_results_json(char *buf, size_t buf_len)
+{
+    if (!s_scan_done || s_scan_count == 0) {
+        return snprintf(buf, buf_len, "[]");
+    }
+
+    int pos = 0;
+    pos += snprintf(buf + pos, buf_len - pos, "[");
+
+    for (int i = 0; i < s_scan_count && pos < (int)buf_len - 1; i++) {
+        if (i > 0) pos += snprintf(buf + pos, buf_len - pos, ",");
+        pos += snprintf(buf + pos, buf_len - pos,
+            "{\"ssid\":\"%s\",\"rssi\":\"%d\",\"type\":\"%s\"}",
+            s_scan_results[i].ssid,
+            s_scan_results[i].rssi,
+            (s_scan_results[i].authmode == WIFI_AUTH_OPEN) ? "open" : "close");
+    }
+
+    pos += snprintf(buf + pos, buf_len - pos, "]");
+    return pos;
+}
+
+net_status_t network_get_status(void)
+{
+    return s_status;
+}
+
+void network_get_ip_str(char *buf, size_t buf_len)
+{
+    strncpy(buf, s_ip_str, buf_len);
+    buf[buf_len - 1] = '\0';
+}
+
+bool network_is_sta_mode(void)
+{
+    return s_sta_mode;
+}
