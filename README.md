@@ -29,53 +29,56 @@ Run `tools\Flash\binary-merged\flash-merged.sh` with SD-WIFI-PRO plugged in with
 Backup flashing if the merged bin fails:
 Run `tools\Flash\install-all-4M custom-spiifs.bat` with SD-WIFI-PRO plugged in with dip switches set to 01 (off on)
 
+## Update firmware
+
+Reflash:
+See above
+
+OTA:
+In the settings menu upload the correct bin and the ESP will perform an OTA
+There are 2 possible bins to upload, rt4k-wifi-sd-card.bin for the code and storage.bin for the SPIFFS partition (static files for the web UI)
+Depending on what's been updated you might only have to flash one of these but it's best to flash both
+
 ## Access SD WIFI PRO (SWP)
+1. Access the softAP RT4K-SD-WIFI
+2. Go to the settings page
+3. Scan for Wifi or enter SSID manually and then enter password
+4. Hit connect, connection details will be saved to the NVS and should stay even through updates
+
+
+Below is broken - might be fixed soon TM
 1. Add a text file to the root of the SD card named `config.txt`
 2. Format it like below:
 ```
 SSID=
 PASSWORD=
 ```
-3. On boot of the ESP you can check the serial port to see what IP your router has assigned to it ~~or use `http://rt4ksd.local/` if mDNS decides to work for once~~ - mDNS broke - who would have guessed?
+3. On boot of the ESP you can check the serial port to see what IP your router has assigned to it or use `[http://rt4ksd.local/](http://rt4ksdcard.local/)` 
 
 ## Building 
 Building the code should work via the Arduino IDE although I have had problems with it when using ESP32 v3.x
 
-### External Libs:
-- ArduinoJson 7.3.0 @ Should be available through Arduino CLI/IDE
-- Async TCP 3.3.2 @ https://github.com/mathieucarbou/AsyncTCP
-- ESP Async WebServer 3.6.0 @ https://github.com/mathieucarbou/ESPAsyncWebServer
-- ESPAsyncTCP 1.2.4 @ https://github.com/dvarrel/ESPAsyncTCP
+### libs:
+Now using standard libs from the IDF component register
+- esp_http_server 
+- esp_common
+- log
+- spiffs
+- sd_control
+- network
+- app_update
 
-### All libs:
-- FS 3.1.1
-- EEPROM 3.1.1
-- WiFi 3.1.1
-- Networking 3.1.1
-- Async TCP 3.3.2
-- ESP Async WebServer 3.6.0
-- SPIFFS 3.1.1
-- Ticker 3.1.1
-- ArduinoOTA 3.1.1
-- Update 3.1.1
-- ArduinoJson 7.3.0
-- SPI 3.1.1
-- SD 3.1.1
-- ESDNSPm 3.1.1
-- SD_MMC 3.1.1
 
 ### Command for building via CLI
 ```bash
-arduino-cli compile --fqbn esp32:esp32:pico32:PartitionScheme=no_ota --output-dir build
+idf.py build
 ```
 
 ### Building the SPIFFS bin:
-I've only tested this in Linux, so who knows:
+idf build now handles this via the below in cMakeLists
 ```bash
-/home/<user>/.arduino15/packages/esp32/tools/mkspiffs/0.2.3/mkspiffs -c data --page 256 --block 4096 --size 0x1E0000 tools/Flash/binary-4M/RT4K-WIFI-SD-CARD.filesystem.bin
+spiffs_create_partition_image(storage data FLASH_IN_PROJECT)
 ```
-
-Copy `RT4K-WIFI-SD-CARD.ino.bin` into `tools/Flash/binary-XM` (likely using the 4M version)
 
 Optional-Merged:  
 `tools\Flash\merge_bin.bat` is a batch file to merge all of the seperate bins to one bin for flashing (SH file coming soon TM)
