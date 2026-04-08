@@ -17,6 +17,7 @@ static const char *TAG = "sd_ctrl";
 
 #define SPI_BLOCKOUT_BOOTUP_PERIOD_S   10
 #define SPI_BLOCKOUT_PERIOD_MS         5000
+#define SDSPI_MAX_TRANSFER_SIZE        (8 * 1024)
 
 /* State */
 static volatile int64_t s_blockout_time_us = 0;
@@ -92,13 +93,6 @@ esp_err_t sd_control_init(void)
     /* Set initial blockout time */
     s_blockout_time_us = esp_timer_get_time() + (SPI_BLOCKOUT_PERIOD_MS * 1000LL);
 
-    /* Wait for RT4K to assert SD card first */
-    for (int i = 0; i < SPI_BLOCKOUT_BOOTUP_PERIOD_S; i++) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "Waiting for RT4K to assert SD card... (%d/%d)",
-                 i + 1, SPI_BLOCKOUT_BOOTUP_PERIOD_S);
-    }
-
     ESP_LOGI(TAG, "SD access disabled by default — enable via web UI");
 
     return ESP_OK;
@@ -127,7 +121,7 @@ void sd_control_take(void)
             .sclk_io_num = PIN_SD_SCLK,
             .quadwp_io_num = -1,
             .quadhd_io_num = -1,
-            .max_transfer_sz = 4096,
+            .max_transfer_sz = SDSPI_MAX_TRANSFER_SIZE,
         };
         esp_err_t err = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -144,7 +138,7 @@ void sd_control_take(void)
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 0,
+        .allocation_unit_size = 4 * 1024,
     };
 
     sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();

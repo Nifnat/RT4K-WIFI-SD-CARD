@@ -8,7 +8,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
-#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 
 static const char *TAG = "config";
 
@@ -21,7 +21,8 @@ static const char *TAG = "config";
 static void sha256_hex(const char *input, char *output)
 {
     unsigned char hash[32];
-    mbedtls_sha256((const unsigned char *)input, strlen(input), hash, 0);
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+              (const unsigned char *)input, strlen(input), hash);
     for (int i = 0; i < 32; i++) {
         sprintf(output + i * 2, "%02x", hash[i]);
     }
@@ -221,6 +222,22 @@ void rt4k_config_clear(void)
         nvs_close(handle);
     }
     ESP_LOGI(TAG, "Config cleared");
+}
+
+void rt4k_config_clear_wifi(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        nvs_erase_key(handle, NVS_KEY_SSID);
+        nvs_erase_key(handle, NVS_KEY_PASS);
+        err = nvs_commit(handle);
+        nvs_close(handle);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to commit WiFi credential clear: %s", esp_err_to_name(err));
+        }
+    }
+    ESP_LOGI(TAG, "WiFi credentials cleared");
 }
 
 bool rt4k_config_get_ota_password(char *buf, size_t buf_len)

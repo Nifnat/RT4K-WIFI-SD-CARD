@@ -8,10 +8,12 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 
 static const char *TAG = "network";
 
@@ -39,7 +41,113 @@ static char s_pending_ssid[32];
 static char s_pending_pass[64];
 
 static int s_retry_count = 0;
-#define MAX_RETRIES 10
+static TimerHandle_t s_reconnect_timer = NULL;
+
+#define MAX_RETRIES          15
+#define BACKOFF_BASE_MS      1000
+#define BACKOFF_CAP_MS       30000
+
+static size_t json_escaped_len(const uint8_t *src)
+{
+    size_t len = 0;
+    size_t src_len = strnlen((const char *)src, sizeof(s_scan_results[0].ssid));
+
+    for (size_t i = 0; i < src_len; i++) {
+        unsigned char ch = src[i];
+        switch (ch) {
+        case '"':
+        case '\\':
+        case '\b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+            len += 2;
+            break;
+        default:
+            len += (ch < 0x20) ? 6 : 1;
+            break;
+        }
+    }
+
+    return len;
+}
+
+static bool append_json_escaped(char *buf, size_t buf_len, int *pos, const uint8_t *src)
+{
+    size_t src_len = strnlen((const char *)src, sizeof(s_scan_results[0].ssid));
+
+    for (size_t i = 0; i < src_len; i++) {
+        unsigned char ch = src[i];
+        const char *escaped = NULL;
+        char unicode_escape[7];
+        char raw[2] = { (char)ch, '\0' };
+
+        switch (ch) {
+        case '"':
+            escaped = "\\\"";
+            break;
+        case '\\':
+            escaped = "\\\\";
+            break;
+        case '\b':
+            escaped = "\\b";
+            break;
+        case '\f':
+            escaped = "\\f";
+            break;
+        case '\n':
+            escaped = "\\n";
+            break;
+        case '\r':
+            escaped = "\\r";
+            break;
+        case '\t':
+            escaped = "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", ch);
+                escaped = unicode_escape;
+            } else {
+                escaped = raw;
+            }
+            break;
+        }
+
+        size_t write_len = strlen(escaped);
+        if (*pos + (int)write_len >= (int)buf_len) {
+            return false;
+        }
+
+        memcpy(buf + *pos, escaped, write_len);
+        *pos += (int)write_len;
+    }
+
+    return true;
+}
+
+static uint32_t get_backoff_ms(int retry)
+{
+    uint32_t ms = BACKOFF_BASE_MS;
+    for (int i = 0; i < retry && i < 5; i++) {
+        ms *= 2;
+    }
+    return ms > BACKOFF_CAP_MS ? BACKOFF_CAP_MS : ms;
+}
+
+static void ensure_ap_netif(void)
+{
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+}
+
+static void reconnect_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+    esp_wifi_connect();
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -47,7 +155,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
         case WIFI_EVENT_STA_START:
-            esp_wifi_connect();
+            if (s_sta_mode) {
+                esp_wifi_connect();
+            }
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED:
@@ -55,8 +165,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_ip_str[0] = '\0';
             if (s_retry_count < MAX_RETRIES) {
                 s_retry_count++;
-                ESP_LOGI(TAG, "Retry WiFi connection (%d/%d)", s_retry_count, MAX_RETRIES);
-                esp_wifi_connect();
+                uint32_t delay_ms = get_backoff_ms(s_retry_count - 1);
+                ESP_LOGI(TAG, "WiFi disconnected, retry %d/%d in %lu ms",
+                         s_retry_count, MAX_RETRIES, (unsigned long)delay_ms);
+                xTimerChangePeriod(s_reconnect_timer,
+                                   pdMS_TO_TICKS(delay_ms), 0);
             } else {
                 ESP_LOGW(TAG, "WiFi connection failed after %d retries", MAX_RETRIES);
                 xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -86,6 +199,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "Connected - IP: %s", s_ip_str);
         s_status = NET_STATUS_CONNECTED;
+        xTimerStop(s_reconnect_timer, 0);
         s_retry_count = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -93,27 +207,33 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static void start_mdns(void)
 {
+    mdns_free();
+
     esp_err_t err = mdns_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mDNS init failed: %s", esp_err_to_name(err));
         return;
     }
-    mdns_hostname_set("rt4ksdcard");
-    mdns_instance_name_set("RT4K SD Card WiFi");
+
+    mdns_hostname_set("rt4ksd");
+    mdns_instance_name_set("RT4K SD WiFi");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-    ESP_LOGI(TAG, "mDNS started: rt4ksdcard.local");
+
+    ESP_LOGI(TAG, "mDNS started: rt4ksd.local");
 }
 
 esp_err_t network_init(void)
 {
     s_wifi_event_group = xEventGroupCreate();
     s_scan_mutex = xSemaphoreCreateMutex();
+    s_reconnect_timer = xTimerCreate("wifi_reconn", pdMS_TO_TICKS(1000),
+                                      pdFALSE, NULL, reconnect_timer_cb);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
-    s_ap_netif = esp_netif_create_default_wifi_ap();
+    /* AP netif created on demand by ensure_ap_netif() */
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -141,8 +261,8 @@ void network_start(void)
     s_retry_count = 0;
 
     wifi_config_t wifi_cfg = {};
-    strncpy((char *)wifi_cfg.sta.ssid, cfg.ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, cfg.password, sizeof(wifi_cfg.sta.password) - 1);
+    strlcpy((char *)wifi_cfg.sta.ssid, cfg.ssid, sizeof(wifi_cfg.sta.ssid));
+    strlcpy((char *)wifi_cfg.sta.password, cfg.password, sizeof(wifi_cfg.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -160,14 +280,15 @@ void network_start(void)
         ESP_LOGI(TAG, "Connected to %s, IP: %s", cfg.ssid, s_ip_str);
         rt4k_config_save(cfg.ssid, cfg.password);
 
-        /* Set minimum modem power save */
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
 
         start_mdns();
     } else {
         ESP_LOGW(TAG, "Connection failed, starting SoftAP");
+        xTimerStop(s_reconnect_timer, 0);
+        s_retry_count = 0;
         esp_wifi_stop();
-        rt4k_config_clear();
+        rt4k_config_clear_wifi();
         network_start_softap();
     }
 }
@@ -176,6 +297,8 @@ void network_start_softap(void)
 {
     s_sta_mode = false;
     s_status = NET_STATUS_DISCONNECTED;
+
+    ensure_ap_netif();
 
     /* Configure AP netif with static IP */
     esp_netif_ip_info_t ip_info;
@@ -223,10 +346,11 @@ bool network_connect(const char *ssid, const char *password)
     s_retry_count = 0;
 
     wifi_config_t wifi_cfg = {};
-    strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+    strlcpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));
+    strlcpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password));
 
     /* Use AP+STA so the config page remains accessible during connection */
+    ensure_ap_netif();
     esp_wifi_set_mode(WIFI_MODE_APSTA);
 
     /* Configure AP side to keep captive portal accessible */
@@ -255,9 +379,9 @@ bool network_connect(const char *ssid, const char *password)
     /* Wait for result in background — the event handler updates status */
     ESP_LOGI(TAG, "Connecting to %s...", ssid);
 
-    /* Save creds optimistically — cleared on failure by event handler path */
-    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
-    strncpy(s_pending_pass, password, sizeof(s_pending_pass) - 1);
+    /* Track the requested credentials for status/reporting during connect */
+    strlcpy(s_pending_ssid, ssid, sizeof(s_pending_ssid));
+    strlcpy(s_pending_pass, password, sizeof(s_pending_pass));
     s_connect_pending = true;
     s_sta_mode = true;
 
@@ -271,7 +395,11 @@ bool network_connect(const char *ssid, const char *password)
 
     if (bits & WIFI_CONNECTED_BIT) {
         rt4k_config_save(ssid, password);
-        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+        /* Connection succeeded — drop SoftAP, switch to STA-only */
+        esp_wifi_set_mode(WIFI_MODE_STA);
+
         start_mdns();
         return true;
     }
@@ -309,12 +437,27 @@ int network_get_scan_results_json(char *buf, size_t buf_len)
     pos += snprintf(buf + pos, buf_len - pos, "[");
 
     for (int i = 0; i < s_scan_count && pos < (int)buf_len - 1; i++) {
+        const char *type = (s_scan_results[i].authmode == WIFI_AUTH_OPEN) ? "open" : "close";
+        int rssi_len = snprintf(NULL, 0, "%d", s_scan_results[i].rssi);
+        size_t entry_needed =
+            (i > 0 ? 1U : 0U) +
+            strlen("{\"ssid\":\"\",\"rssi\":\"\",\"type\":\"\"}") +
+            json_escaped_len(s_scan_results[i].ssid) +
+            (size_t)rssi_len + strlen(type);
+
+        if (pos + (int)entry_needed + 1 >= (int)buf_len) {
+            break;
+        }
+
         if (i > 0) pos += snprintf(buf + pos, buf_len - pos, ",");
+        pos += snprintf(buf + pos, buf_len - pos, "{\"ssid\":\"");
+        if (!append_json_escaped(buf, buf_len, &pos, s_scan_results[i].ssid)) {
+            break;
+        }
         pos += snprintf(buf + pos, buf_len - pos,
-            "{\"ssid\":\"%s\",\"rssi\":\"%d\",\"type\":\"%s\"}",
-            s_scan_results[i].ssid,
+            "\",\"rssi\":\"%d\",\"type\":\"%s\"}",
             s_scan_results[i].rssi,
-            (s_scan_results[i].authmode == WIFI_AUTH_OPEN) ? "open" : "close");
+            type);
     }
 
     pos += snprintf(buf + pos, buf_len - pos, "]");
@@ -329,8 +472,7 @@ net_status_t network_get_status(void)
 
 void network_get_ip_str(char *buf, size_t buf_len)
 {
-    strncpy(buf, s_ip_str, buf_len);
-    buf[buf_len - 1] = '\0';
+    strlcpy(buf, s_ip_str, buf_len);
 }
 
 bool network_is_sta_mode(void)

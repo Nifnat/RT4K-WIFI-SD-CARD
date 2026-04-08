@@ -13,7 +13,6 @@
 
   <script src="js/jquery-3.2.1.slim.min.js"></script>
   <script src="js/index.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js"></script>
 
 </head>
 
@@ -40,7 +39,7 @@
 				<span class="close">&times;</span>
 				<h2>File Editor</h2>
 				<div class="modal-actions">
-					<button class="form-control tm-file-submit" onclick="saveFile()">Save</button>
+          <button id="saveFileButton" class="form-control tm-file-submit" onclick="saveFile()">Save</button>
 					<button class="form-control tm-file-submit" onclick="closeEditor()">Cancel</button>
 				</div>
 			</div>

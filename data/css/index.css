@@ -92,37 +92,71 @@ a:hover, a:focus, a.active {
     width: 100%;
     height: 100%;
     background-color: rgba(0,0,0,0.7);
-    overflow: hidden; /* Changed from overflow-y: auto */
+    overflow: auto;
+    padding: 12px;
+    box-sizing: border-box;
 }
 
 .modal-content {
     background-color: var(--dark-surface);
-    margin: 2% auto;
-    padding: 20px;
+    margin: 0 auto;
+    padding: 16px;
     border: 1px solid var(--dark-surface-lighter);
-    width: 90%;
-    height: 90vh;
+    width: min(92vw, 1400px);
+    height: min(92vh, 900px);
+    max-height: 92vh;
     display: flex;
     flex-direction: column;
-    position: relative; /* Added */
+    position: relative;
+    box-sizing: border-box;
+    overflow: hidden;
+    gap: 12px;
 }
 
 .modal-header {
-    padding: 10px;
+    padding: 0;
     position: relative;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px; /* Added */
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.modal-header h2 {
+    margin: 0;
+    flex: 1 1 auto;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    flex: 0 0 auto;
 }
 
 #editor {
-    flex: 1;
-    min-height: calc(90vh - 100px); /* Explicit calculation */
-    margin: 0; /* Changed from margin: 10px 0 */
+    flex: 1 1 auto;
+    min-height: 0;
+    margin: 0;
     border: 1px solid var(--dark-surface-lighter);
-    position: relative; /* Added */
+    position: relative;
+    overflow: hidden;
+    background-color: var(--dark-bg);
+}
+
+#editor .CodeMirror {
+    height: 100% !important;
+    font-size: 14px;
+}
+
+#editor .CodeMirror-gutters {
+    background-color: var(--dark-surface);
+    border-right: 1px solid var(--dark-surface-lighter);
+}
+
+#editor .CodeMirror-lines {
+    padding: 0;
 }
 
 /* Remove the modal-footer styles since we moved the buttons to the header */

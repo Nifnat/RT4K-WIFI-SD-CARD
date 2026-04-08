@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_spiffs.h"
 #include "nvs_flash.h"
 
@@ -21,6 +22,19 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Configure power management: 80 MHz max, 40 MHz idle, light sleep */
+    #if CONFIG_PM_ENABLE
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = 80,
+            .min_freq_mhz = 40,
+    #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+            .light_sleep_enable = true,
+    #endif
+        };
+        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+        ESP_LOGI(TAG, "Power management: 80/40 MHz, light sleep enabled");
+    #endif
 
     /* Initialize SPIFFS for web UI static files */
     esp_vfs_spiffs_conf_t spiffs_cfg = {

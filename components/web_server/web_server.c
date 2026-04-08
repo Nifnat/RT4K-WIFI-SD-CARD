@@ -16,12 +16,25 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_partition.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 
 static const char *TAG = "webserver";
 static httpd_handle_t s_server = NULL;
 
 /* Buffer size for streaming file data */
 #define FILE_BUF_SIZE 4096
+#define SMALL_POST_BODY_MAX 1024
+#define MODELINE_POST_BODY_MAX (12 * 1024)
+#define MODELINE_CONTENT_MAX   (8 * 1024)
+
+/* Upload async writer configuration */
+#define UPLOAD_RECV_BUF_SIZE   4096      /* Network recv chunk */
+#define UPLOAD_RING_SLOTS      4         /* Number of ring buffer slots */
+#define UPLOAD_RING_SLOT_SIZE  (16384)   /* 16KB per slot */
+#define UPLOAD_WRITER_STACK    4096      /* Writer task stack */
 
 /* SPIFFS mount point for static web assets */
 #define SPIFFS_MOUNT "/spiffs"
@@ -93,10 +106,10 @@ static void url_decode(char *str)
 }
 
 /* Read full POST body into a buffer. Caller must free. Returns length or -1. */
-static int read_post_body(httpd_req_t *req, char **out_buf)
+static int read_post_body(httpd_req_t *req, char **out_buf, int max_len)
 {
     int total = req->content_len;
-    if (total <= 0 || total > 4096) return -1;
+    if (total <= 0 || total > max_len) return -1;
 
     char *buf = malloc(total + 1);
     if (!buf) return -1;
@@ -381,7 +394,7 @@ static esp_err_t handle_rename(httpd_req_t *req)
     }
 
     char *body = NULL;
-    if (read_post_body(req, &body) < 0) {
+    if (read_post_body(req, &body, SMALL_POST_BODY_MAX) < 0) {
         httpd_resp_set_status(req, "500");
         httpd_resp_sendstr(req, "RENAME:BADARGS");
         return ESP_OK;
@@ -452,10 +465,152 @@ static esp_err_t handle_rename(httpd_req_t *req)
 /* ─── /upload ─────────────────────────────────────────────────────── */
 
 /*
- * Upload handler: receives multipart/form-data.
- * The ESP-IDF HTTP server does NOT have built-in multipart parsing,
- * so we parse the multipart boundary manually to extract the file data.
+ * Async upload handler with producer-consumer architecture.
+ *
+ * The HTTP handler task receives data from the network into a ring buffer.
+ * A separate writer task drains the ring buffer to the SD card in large
+ * (UPLOAD_RING_SLOT_SIZE) writes, keeping the TCP window open while
+ * the SD card is busy.
+ *
+ * Supports two modes:
+ *   1. Raw body:  POST /upload?path=/dir&filename=foo.bin
+ *      Content-Type: application/octet-stream — skips multipart overhead.
+ *   2. Multipart: POST /upload?path=/dir  with multipart/form-data body.
+ *      Headers are parsed synchronously; file data streams through the ring.
  */
+
+/* ── Ring buffer shared between recv (producer) and writer (consumer) ── */
+
+typedef struct {
+    char   *slots;                         /* UPLOAD_RING_SLOTS × UPLOAD_RING_SLOT_SIZE */
+    size_t  slot_len[UPLOAD_RING_SLOTS];   /* bytes valid in each slot */
+    int     wr;                            /* next slot producer fills */
+    int     rd;                            /* next slot consumer writes to SD */
+    SemaphoreHandle_t full;                /* counts slots ready to write */
+    SemaphoreHandle_t empty;               /* counts free slots */
+    SemaphoreHandle_t writer_done;         /* signaled by writer before exit */
+    bool    done;                          /* producer sets when finished */
+    bool    error;                         /* set by either side on failure */
+    const char *error_msg;
+    char    file_path[512];                /* full VFS path for writer to open */
+    int64_t write_us;                      /* total SD write time (µs) */
+} upload_ring_t;
+
+/* Writer task: runs on its own stack, writes ring slots to SD */
+static void upload_writer_task(void *arg)
+{
+    upload_ring_t *ring = (upload_ring_t *)arg;
+    FILE *f = NULL;
+
+    /* Open file for writing */
+    unlink(ring->file_path);
+    f = fopen(ring->file_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Writer: failed to open %s", ring->file_path);
+        ring->error = true;
+        ring->error_msg = "UPLOAD:OPEN";
+        /* Drain all pending signals so producer doesn't block forever */
+        while (!ring->done || xSemaphoreTake(ring->full, 0) == pdTRUE) {
+            xSemaphoreGive(ring->empty);
+            if (!ring->done) xSemaphoreTake(ring->full, pdMS_TO_TICKS(100));
+        }
+        xSemaphoreGive(ring->writer_done);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Writer: writing to %s", ring->file_path);
+
+    while (true) {
+        /* Wait for a full slot (with timeout so we can detect completion) */
+        if (xSemaphoreTake(ring->full, pdMS_TO_TICKS(200)) != pdTRUE) {
+            if (ring->done || ring->error) break;
+            continue;
+        }
+
+        if (ring->error) {
+            xSemaphoreGive(ring->empty);
+            break;
+        }
+
+        size_t len = ring->slot_len[ring->rd];
+        if (len > 0) {
+            int64_t t0 = esp_timer_get_time();
+            size_t written = fwrite(ring->slots + (ring->rd * UPLOAD_RING_SLOT_SIZE), 1, len, f);
+            ring->write_us += esp_timer_get_time() - t0;
+
+            if (written != len) {
+                ESP_LOGE(TAG, "Writer: short write (%u/%u)", written, len);
+                ring->error = true;
+                ring->error_msg = "UPLOAD:WRITE";
+                xSemaphoreGive(ring->empty);
+                break;
+            }
+        }
+
+        ring->rd = (ring->rd + 1) % UPLOAD_RING_SLOTS;
+        xSemaphoreGive(ring->empty);
+    }
+
+    if (f) {
+        if (fclose(f) != 0 && !ring->error) {
+            ESP_LOGE(TAG, "Writer: fclose failed");
+            ring->error = true;
+            ring->error_msg = "UPLOAD:CLOSE";
+        }
+    }
+
+    /* Drain remaining signals so producer unblocks */
+    while (xSemaphoreTake(ring->full, 0) == pdTRUE) {
+        xSemaphoreGive(ring->empty);
+    }
+
+    xSemaphoreGive(ring->writer_done);
+    vTaskDelete(NULL);
+}
+
+/* Push data into the ring buffer, splitting across slot boundaries */
+static bool ring_push(upload_ring_t *ring, const char *data, size_t len)
+{
+    while (len > 0 && !ring->error) {
+        size_t slot_used = ring->slot_len[ring->wr];
+        size_t space = UPLOAD_RING_SLOT_SIZE - slot_used;
+
+        if (space == 0) {
+            /* Current slot full — hand to writer */
+            xSemaphoreGive(ring->full);
+            /* Wait for a free slot */
+            while (xSemaphoreTake(ring->empty, pdMS_TO_TICKS(200)) != pdTRUE) {
+                if (ring->error) return false;
+            }
+            ring->wr = (ring->wr + 1) % UPLOAD_RING_SLOTS;
+            ring->slot_len[ring->wr] = 0;
+            slot_used = 0;
+            space = UPLOAD_RING_SLOT_SIZE;
+        }
+
+        size_t chunk = len < space ? len : space;
+        memcpy(ring->slots + (ring->wr * UPLOAD_RING_SLOT_SIZE) + slot_used, data, chunk);
+        ring->slot_len[ring->wr] += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+    return !ring->error;
+}
+
+/* Flush the current partially-filled slot to the writer */
+static void ring_flush(upload_ring_t *ring)
+{
+    if (ring->slot_len[ring->wr] > 0) {
+        xSemaphoreGive(ring->full);
+        /* Wait for writer to consume it */
+        while (xSemaphoreTake(ring->empty, pdMS_TO_TICKS(200)) != pdTRUE) {
+            if (ring->error) return;
+        }
+        ring->wr = (ring->wr + 1) % UPLOAD_RING_SLOTS;
+        ring->slot_len[ring->wr] = 0;
+    }
+}
 
 /* Find a substring in a buffer (not null-terminated) */
 static const char *memmem_find(const char *haystack, size_t hlen,
@@ -463,11 +618,74 @@ static const char *memmem_find(const char *haystack, size_t hlen,
 {
     if (nlen > hlen) return NULL;
     for (size_t i = 0; i <= hlen - nlen; i++) {
-        if (memcmp(haystack + i, needle, nlen) == 0) {
+        if (memcmp(haystack + i, needle, nlen) == 0)
             return haystack + i;
-        }
     }
     return NULL;
+}
+
+/*
+ * Drain multipart preamble + headers from the request, returning the
+ * extracted filename.  Returns bytes of leftover data already read
+ * past the header that belong to the file body, stored in `leftover`.
+ * Returns -1 on error.
+ */
+static int multipart_drain_headers(httpd_req_t *req, const char *boundary,
+                                   size_t boundary_len, int *remaining,
+                                   char *filename, size_t fname_size,
+                                   char *leftover, size_t leftover_cap)
+{
+    /* Small buffer to accumulate preamble+headers (typically < 512 bytes) */
+    char hdr_buf[1024];
+    size_t hdr_len = 0;
+
+    while (*remaining > 0 && hdr_len < sizeof(hdr_buf) - 1) {
+        int to_recv = *remaining < (int)(sizeof(hdr_buf) - hdr_len)
+                      ? *remaining : (int)(sizeof(hdr_buf) - hdr_len);
+        int received = httpd_req_recv(req, hdr_buf + hdr_len, to_recv);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            return -1;
+        }
+        *remaining -= received;
+        hdr_len += received;
+
+        /* Look for boundary followed by headers ending with \r\n\r\n */
+        const char *bnd = memmem_find(hdr_buf, hdr_len, boundary, boundary_len);
+        if (!bnd) continue;
+
+        /* Find end-of-headers after boundary */
+        size_t after_bnd = (bnd - hdr_buf) + boundary_len;
+        /* Skip CRLF after boundary */
+        if (after_bnd + 2 <= hdr_len && hdr_buf[after_bnd] == '\r' && hdr_buf[after_bnd + 1] == '\n')
+            after_bnd += 2;
+
+        const char *hdr_end = memmem_find(hdr_buf + after_bnd, hdr_len - after_bnd, "\r\n\r\n", 4);
+        if (!hdr_end) continue;
+
+        /* Extract filename from Content-Disposition */
+        size_t headers_region = hdr_end - (hdr_buf + after_bnd);
+        const char *fn_start = memmem_find(hdr_buf + after_bnd, headers_region, "filename=\"", 10);
+        if (fn_start) {
+            fn_start += 10;
+            const char *fn_end = memchr(fn_start, '"', headers_region - (fn_start - (hdr_buf + after_bnd)));
+            if (fn_end) {
+                size_t flen = fn_end - fn_start;
+                if (flen >= fname_size) flen = fname_size - 1;
+                memcpy(filename, fn_start, flen);
+                filename[flen] = '\0';
+            }
+        }
+
+        /* Everything after \r\n\r\n is file data */
+        size_t body_start = (hdr_end - hdr_buf) + 4;
+        size_t leftover_len = hdr_len - body_start;
+        if (leftover_len > leftover_cap) leftover_len = leftover_cap;
+        memcpy(leftover, hdr_buf + body_start, leftover_len);
+        return (int)leftover_len;
+    }
+
+    return -1; /* headers too large or recv failed */
 }
 
 static esp_err_t handle_upload(httpd_req_t *req)
@@ -479,21 +697,10 @@ static esp_err_t handle_upload(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Get content type to extract boundary */
+    /* ── Determine upload mode: raw vs multipart ── */
     char content_type[128] = "";
     httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type));
-
-    const char *boundary_start = strstr(content_type, "boundary=");
-    if (!boundary_start) {
-        httpd_resp_set_status(req, "400");
-        httpd_resp_sendstr(req, "UPLOAD:NOBOUNDARY");
-        return ESP_OK;
-    }
-    boundary_start += 9; /* skip "boundary=" */
-
-    char boundary[128];
-    snprintf(boundary, sizeof(boundary), "--%s", boundary_start);
-    size_t boundary_len = strlen(boundary);
+    bool is_raw = (strstr(content_type, "multipart") == NULL);
 
     /* Get upload path from query string */
     char upload_dir[256] = "/";
@@ -504,183 +711,239 @@ static esp_err_t handle_upload(httpd_req_t *req)
         upload_dir[0] = '/';
     }
 
+    /* For raw mode, filename comes from query param */
+    char filename[128] = "";
+    if (is_raw) {
+        if (get_query_param(req, "filename", filename, sizeof(filename)) < 0) {
+            httpd_resp_set_status(req, "400");
+            httpd_resp_sendstr(req, "UPLOAD:NOFILENAME");
+            return ESP_OK;
+        }
+        url_decode(filename);
+    }
+
+    /* Multipart: extract boundary */
+    char boundary[128] = "";
+    size_t boundary_len = 0;
+    if (!is_raw) {
+        const char *bs = strstr(content_type, "boundary=");
+        if (!bs) {
+            httpd_resp_set_status(req, "400");
+            httpd_resp_sendstr(req, "UPLOAD:NOBOUNDARY");
+            return ESP_OK;
+        }
+        bs += 9;
+        snprintf(boundary, sizeof(boundary), "--%s", bs);
+        boundary_len = strlen(boundary);
+    }
+
     sd_control_take();
 
     /* Ensure upload directory exists */
     if (strcmp(upload_dir, "/") != 0) {
         char dir_full[300];
         snprintf(dir_full, sizeof(dir_full), "%s%s", SD_MOUNT_POINT, upload_dir);
-        /* Remove trailing slash for mkdir */
         size_t dlen = strlen(dir_full);
         if (dlen > 1 && dir_full[dlen - 1] == '/') dir_full[dlen - 1] = '\0';
-        mkdir(dir_full, 0775); /* ignore error - may already exist */
+        mkdir(dir_full, 0775);
     }
 
-    /* Receive data and parse multipart */
-    char *buf = malloc(FILE_BUF_SIZE);
-    if (!buf) {
+    /* ── Allocate ring buffer ── */
+    upload_ring_t ring = {0};
+    ring.slots = heap_caps_malloc(UPLOAD_RING_SLOTS * UPLOAD_RING_SLOT_SIZE, MALLOC_CAP_8BIT);
+    if (!ring.slots) {
         sd_control_relinquish();
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
         return ESP_OK;
     }
+    ring.full  = xSemaphoreCreateCounting(UPLOAD_RING_SLOTS, 0);
+    ring.empty = xSemaphoreCreateCounting(UPLOAD_RING_SLOTS, UPLOAD_RING_SLOTS);
+    ring.writer_done = xSemaphoreCreateBinary();
+    ring.error_msg = "UPLOAD:FAILED";
 
+    /* Build output file path */
     int remaining = req->content_len;
-    FILE *upload_file = NULL;
-    bool in_file_data = false;
-    bool header_parsed __attribute__((unused)) = false;
-    char filename[128] = "";
+    char file_full[512] = "";
+    const char *error_msg = "UPLOAD:FAILED";
+    bool upload_failed = false;
 
-    /* Accumulator for boundary detection at chunk edges */
-    char *accum = malloc(FILE_BUF_SIZE * 2);
-    if (!accum) {
-        free(buf);
-        sd_control_relinquish();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
-        return ESP_OK;
+    /* For multipart, parse headers to get filename */
+    char *leftover_buf = NULL;
+    int leftover_len = 0;
+
+    if (!is_raw) {
+        leftover_buf = malloc(UPLOAD_RECV_BUF_SIZE);
+        if (!leftover_buf) {
+            free(ring.slots);
+            vSemaphoreDelete(ring.full);
+            vSemaphoreDelete(ring.empty);
+            vSemaphoreDelete(ring.writer_done);
+            sd_control_relinquish();
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+            return ESP_OK;
+        }
+
+        leftover_len = multipart_drain_headers(req, boundary, boundary_len,
+                                                &remaining, filename, sizeof(filename),
+                                                leftover_buf, UPLOAD_RECV_BUF_SIZE);
+        if (leftover_len < 0 || filename[0] == '\0') {
+            upload_failed = true;
+            error_msg = "UPLOAD:HEADERS";
+        }
     }
-    size_t accum_len = 0;
 
-    while (remaining > 0) {
-        int to_recv = remaining < FILE_BUF_SIZE ? remaining : FILE_BUF_SIZE;
-        int received = httpd_req_recv(req, buf, to_recv);
-        if (received <= 0) {
-            ESP_LOGW(TAG, "Upload: recv error");
-            break;
+    if (!upload_failed && filename[0] == '\0') {
+        upload_failed = true;
+        error_msg = "UPLOAD:NOFILE";
+    }
+
+    if (!upload_failed) {
+        if (upload_dir[strlen(upload_dir) - 1] == '/') {
+            snprintf(file_full, sizeof(file_full), "%s%s%s",
+                     SD_MOUNT_POINT, upload_dir, filename);
+        } else {
+            snprintf(file_full, sizeof(file_full), "%s%s/%s",
+                     SD_MOUNT_POINT, upload_dir, filename);
         }
-        remaining -= received;
+        snprintf(ring.file_path, sizeof(ring.file_path), "%s", file_full);
 
-        /* Append to accumulator */
-        if (accum_len + received > FILE_BUF_SIZE * 2) {
-            /* Flush the safe portion that can't contain a split boundary */
-            if (in_file_data && upload_file) {
-                size_t safe = accum_len - boundary_len;
-                if (safe > 0) {
-                    fwrite(accum, 1, safe, upload_file);
-                    memmove(accum, accum + safe, accum_len - safe);
-                    accum_len -= safe;
-                }
-            }
+        /* Take an empty slot for initial filling */
+        xSemaphoreTake(ring.empty, portMAX_DELAY);
+        ring.slot_len[0] = 0;
+
+        /* Start writer task */
+        TaskHandle_t writer = NULL;
+        if (xTaskCreate(upload_writer_task, "upld_wr", UPLOAD_WRITER_STACK,
+                        &ring, tskIDLE_PRIORITY + 2, &writer) != pdPASS) {
+            upload_failed = true;
+            error_msg = "UPLOAD:TASK";
+            xSemaphoreGive(ring.empty);
         }
-        memcpy(accum + accum_len, buf, received);
-        accum_len += received;
+    }
 
-        /* Process accumulated data */
-        while (accum_len > 0) {
-            if (!in_file_data) {
-                /* Look for boundary */
-                const char *bnd = memmem_find(accum, accum_len, boundary, boundary_len);
-                if (!bnd) break;
+    bool writer_started = !upload_failed;
+    int64_t recv_us = 0;
+    int64_t total_bytes = 0;
 
-                /* Move past boundary + CRLF */
-                size_t skip = (bnd - accum) + boundary_len;
-                if (skip + 2 <= accum_len && accum[skip] == '\r' && accum[skip + 1] == '\n') {
-                    skip += 2;
-                }
+    /* ── Push leftover header data into ring ── */
+    if (!upload_failed && !is_raw && leftover_len > 0) {
+        /* For multipart, we need to watch for the closing boundary in the tail.
+         * The closing boundary "\r\n--boundary--" is at the very end of the body.
+         * We know 'remaining' bytes are left, and the tail contains the boundary.
+         * We'll trim the boundary from the data at the end. */
+        if (!ring_push(&ring, leftover_buf, leftover_len)) {
+            upload_failed = true;
+            error_msg = ring.error_msg;
+        }
+        total_bytes += leftover_len;
+    }
 
-                /* Check for closing boundary (--boundary--) */
-                if (skip <= accum_len && bnd[boundary_len] == '-' && bnd[boundary_len + 1] == '-') {
-                    /* End of multipart */
-                    accum_len = 0;
+    free(leftover_buf);
+    leftover_buf = NULL;
+
+    /* ── Main recv loop: read from network → push into ring ── */
+    if (!upload_failed) {
+        char *recv_buf = malloc(UPLOAD_RECV_BUF_SIZE);
+        if (!recv_buf) {
+            upload_failed = true;
+            error_msg = "UPLOAD:NOMEM";
+        } else {
+            while (remaining > 0 && !upload_failed && !ring.error) {
+                int to_recv = remaining < (int)UPLOAD_RECV_BUF_SIZE ? remaining : (int)UPLOAD_RECV_BUF_SIZE;
+                int64_t t0 = esp_timer_get_time();
+                int received = httpd_req_recv(req, recv_buf, to_recv);
+                recv_us += esp_timer_get_time() - t0;
+
+                if (received <= 0) {
+                    if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+                    upload_failed = true;
+                    error_msg = "UPLOAD:RECV";
                     break;
                 }
+                remaining -= received;
 
-                memmove(accum, accum + skip, accum_len - skip);
-                accum_len -= skip;
-
-                /* Parse headers until empty line */
-                const char *header_end = memmem_find(accum, accum_len, "\r\n\r\n", 4);
-                if (!header_end) break; /* Need more data */
-
-                /* Extract filename from Content-Disposition header */
-                size_t hdr_len = header_end - accum;
-                const char *fname_start = memmem_find(accum, hdr_len, "filename=\"", 10);
-                if (fname_start) {
-                    fname_start += 10;
-                    const char *fname_end = memchr(fname_start, '"', hdr_len - (fname_start - accum));
-                    if (fname_end) {
-                        size_t flen = fname_end - fname_start;
-                        if (flen >= sizeof(filename)) flen = sizeof(filename) - 1;
-                        memcpy(filename, fname_start, flen);
-                        filename[flen] = '\0';
-                    }
+                if (!ring_push(&ring, recv_buf, received)) {
+                    upload_failed = true;
+                    error_msg = ring.error_msg;
+                    break;
                 }
+                total_bytes += received;
+            }
+            free(recv_buf);
+        }
+    }
 
-                /* Skip past headers */
-                skip = (header_end - accum) + 4;
-                memmove(accum, accum + skip, accum_len - skip);
-                accum_len -= skip;
+    /* ── Signal writer we're done ── */
+    if (writer_started) {
+        ring_flush(&ring);
+        ring.done = true;
+        /* Give one more signal to wake writer if it's waiting */
+        xSemaphoreGive(ring.full);
 
-                if (filename[0] != '\0') {
-                    /* Open file for writing */
-                    char file_full[512];
-                    if (upload_dir[strlen(upload_dir) - 1] == '/') {
-                        snprintf(file_full, sizeof(file_full), "%s%s%s",
-                                 SD_MOUNT_POINT, upload_dir, filename);
+        /* Wait for writer task to finish */
+        xSemaphoreTake(ring.writer_done, pdMS_TO_TICKS(10000));
+    }
+
+    if (ring.error && !upload_failed) {
+        upload_failed = true;
+        error_msg = ring.error_msg;
+    }
+
+    /* ── For multipart, the data we pushed includes the closing boundary.
+     *    The file on disk has the trailing "\r\n--boundary--\r\n" appended.
+     *    Truncate it off. ── */
+    if (!upload_failed && !is_raw && boundary_len > 0) {
+        struct stat st;
+        if (stat(file_full, &st) == 0 && st.st_size > 0) {
+            /* Closing boundary = "\r\n" + boundary + "--" + optional "\r\n"
+             * We need to find exactly where it starts and truncate. */
+            size_t tail_max = boundary_len + 8; /* \r\n + boundary + -- + \r\n */
+            if ((size_t)st.st_size > tail_max) {
+                FILE *f = fopen(file_full, "r+b");
+                if (f) {
+                    char tail[256];
+                    size_t to_read = tail_max < sizeof(tail) ? tail_max : sizeof(tail);
+                    long seek_pos = st.st_size - (long)to_read;
+                    fseek(f, seek_pos, SEEK_SET);
+                    size_t got = fread(tail, 1, to_read, f);
+                    /* Find "\r\n--boundary" in the tail */
+                    const char *bnd = memmem_find(tail, got, boundary, boundary_len);
+                    if (bnd) {
+                        long trim_pos = seek_pos + (bnd - tail);
+                        /* Also trim preceding \r\n */
+                        if (trim_pos >= 2) trim_pos -= 2;
+                        fclose(f);
+                        truncate(file_full, trim_pos);
                     } else {
-                        snprintf(file_full, sizeof(file_full), "%s%s/%s",
-                                 SD_MOUNT_POINT, upload_dir, filename);
+                        fclose(f);
                     }
-
-                    /* Remove existing file */
-                    unlink(file_full);
-
-                    upload_file = fopen(file_full, "w");
-                    if (!upload_file) {
-                        ESP_LOGE(TAG, "Upload: failed to open %s", file_full);
-                    } else {
-                        ESP_LOGI(TAG, "Upload: writing to %s", file_full);
-                        in_file_data = true;
-                        header_parsed = true;
-                    }
-                }
-            } else {
-                /* We're inside file data — look for next boundary */
-                const char *bnd = memmem_find(accum, accum_len, boundary, boundary_len);
-                if (bnd) {
-                    /* Write data up to boundary (minus preceding \r\n) */
-                    size_t data_len = bnd - accum;
-                    if (data_len >= 2) data_len -= 2; /* Strip trailing \r\n before boundary */
-                    if (upload_file && data_len > 0) {
-                        fwrite(accum, 1, data_len, upload_file);
-                    }
-                    if (upload_file) {
-                        fclose(upload_file);
-                        upload_file = NULL;
-                    }
-                    in_file_data = false;
-                    filename[0] = '\0';
-
-                    /* Don't consume boundary — let outer loop handle it */
-                    size_t consumed = bnd - accum;
-                    memmove(accum, accum + consumed, accum_len - consumed);
-                    accum_len -= consumed;
-                } else {
-                    /* No boundary found — write safe data, keep tail for boundary straddling */
-                    if (accum_len > boundary_len + 4) {
-                        size_t safe = accum_len - boundary_len - 4;
-                        if (upload_file) {
-                            fwrite(accum, 1, safe, upload_file);
-                        }
-                        memmove(accum, accum + safe, accum_len - safe);
-                        accum_len -= safe;
-                    }
-                    break; /* Need more data */
                 }
             }
         }
     }
 
-    /* Clean up */
-    if (upload_file) {
-        fclose(upload_file);
-    }
-
-    free(buf);
-    free(accum);
+    /* ── Clean up ── */
+    free(ring.slots);
+    vSemaphoreDelete(ring.full);
+    vSemaphoreDelete(ring.empty);
+    vSemaphoreDelete(ring.writer_done);
     sd_control_relinquish();
 
+    if (upload_failed) {
+        if (file_full[0] != '\0') unlink(file_full);
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, error_msg);
+        ESP_LOGW(TAG, "Upload failed: %s", error_msg);
+        return ESP_OK;
+    }
+
+    /* Log timing stats */
+    int64_t total_us = recv_us + ring.write_us;
+    ESP_LOGI(TAG, "Upload complete: %lld bytes, recv=%lldms write=%lldms total=%lldms (%.0f KiB/s)",
+             total_bytes, recv_us / 1000, ring.write_us / 1000, total_us / 1000,
+             total_us > 0 ? (double)total_bytes / 1024.0 * 1000000.0 / (double)total_us : 0.0);
+
     httpd_resp_sendstr(req, "ok");
-    ESP_LOGI(TAG, "Upload complete");
     return ESP_OK;
 }
 
@@ -696,19 +959,27 @@ static esp_err_t handle_modeline(httpd_req_t *req)
     }
 
     char *body = NULL;
-    if (read_post_body(req, &body) < 0) {
+    if (read_post_body(req, &body, MODELINE_POST_BODY_MAX) < 0) {
         httpd_resp_set_status(req, "400");
         httpd_resp_sendstr(req, "Missing body");
         return ESP_OK;
     }
 
     char number[8] = "";
-    char content[1024] = "";
+    char *content = malloc(MODELINE_CONTENT_MAX);
+    if (!content) {
+        free(body);
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "Out of memory");
+        return ESP_OK;
+    }
+    content[0] = '\0';
     parse_form_field(body, "number", number, sizeof(number));
-    parse_form_field(body, "content", content, sizeof(content));
+    parse_form_field(body, "content", content, MODELINE_CONTENT_MAX);
     free(body);
 
     if (number[0] == '\0' || content[0] == '\0') {
+        free(content);
         httpd_resp_set_status(req, "400");
         httpd_resp_sendstr(req, "Missing required parameters");
         return ESP_OK;
@@ -729,6 +1000,7 @@ static esp_err_t handle_modeline(httpd_req_t *req)
 
     FILE *f = fopen(file_path, "w");
     if (!f) {
+        free(content);
         sd_control_relinquish();
         httpd_resp_set_status(req, "500");
         httpd_resp_sendstr(req, "Failed to create file");
@@ -737,6 +1009,7 @@ static esp_err_t handle_modeline(httpd_req_t *req)
 
     int written = fprintf(f, "%s\n", content);
     fclose(f);
+    free(content);
     sd_control_relinquish();
 
     if (written > 0) {
@@ -789,7 +1062,7 @@ static esp_err_t handle_wifi_connect(httpd_req_t *req)
 {
     set_cors_headers(req);
     char *body = NULL;
-    if (read_post_body(req, &body) < 0) {
+    if (read_post_body(req, &body, SMALL_POST_BODY_MAX) < 0) {
         httpd_resp_sendstr(req, "WIFI:BadRequest");
         return ESP_OK;
     }
@@ -839,40 +1112,10 @@ static esp_err_t handle_wifi_list(httpd_req_t *req)
 
 /* ─── Static file serving from SPIFFS ─────────────────────────────── */
 
-#if 0
-/* Check if a string looks like a raw IP address (starts with digit) */
-static bool host_is_ip(const char *host, size_t len)
-{
-    return len > 0 && host[0] >= '0' && host[0] <= '9';
-}
-#endif
-
 static esp_err_t handle_static(httpd_req_t *req)
 {
     set_cors_headers(req);
     const char *uri = req->uri;
-
-    /* IP-to-hostname redirect disabled — mDNS doesn't resolve reliably
-     * on SoftAP networks and some client configurations.
-     * Left here for reference if needed in future. */
-#if 0
-    /* Redirect IP-based access to mDNS hostname to avoid Chrome PNA blocks.
-     * Chrome blocks fetch() from non-secure (HTTP) origins to private IPs,
-     * but allows it when the origin is a .local mDNS hostname.
-     * Only redirect in STA mode — mDNS won't resolve when client is on SoftAP. */
-    char host_buf[64] = "";
-    if (network_is_sta_mode() &&
-        httpd_req_get_hdr_value_str(req, "Host", host_buf, sizeof(host_buf)) == ESP_OK) {
-        if (host_is_ip(host_buf, strlen(host_buf))) {
-            char location[600];
-            snprintf(location, sizeof(location), "http://rt4ksdcard.local%s", uri);
-            httpd_resp_set_status(req, "302 Found");
-            httpd_resp_set_hdr(req, "Location", location);
-            httpd_resp_send(req, NULL, 0);
-            return ESP_OK;
-        }
-    }
-#endif
 
     /* Default to index.htm */
     char path[600];
@@ -949,7 +1192,7 @@ static esp_err_t handle_sd_access_post(httpd_req_t *req)
     set_cors_headers(req);
 
     char *body = NULL;
-    if (read_post_body(req, &body) < 0) {
+    if (read_post_body(req, &body, SMALL_POST_BODY_MAX) < 0) {
         httpd_resp_set_status(req, "400");
         httpd_resp_sendstr(req, "Missing body");
         return ESP_OK;
@@ -1249,7 +1492,7 @@ static esp_err_t handle_ota_password_post(httpd_req_t *req)
     set_cors_headers(req);
 
     char *body = NULL;
-    int len = read_post_body(req, &body);
+    int len = read_post_body(req, &body, SMALL_POST_BODY_MAX);
     if (len < 0) {
         httpd_resp_set_status(req, "400");
         httpd_resp_sendstr(req, "Bad request");

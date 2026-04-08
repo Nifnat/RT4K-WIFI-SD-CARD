@@ -27,9 +27,14 @@ bool rt4k_config_load(rt4k_wifi_config_t *cfg);
 bool rt4k_config_save(const char *ssid, const char *password);
 
 /**
- * Clear stored WiFi credentials from NVS.
+ * Clear all stored config from this namespace in NVS.
  */
 void rt4k_config_clear(void);
+
+/**
+ * Clear only stored WiFi credentials from NVS.
+ */
+void rt4k_config_clear_wifi(void);
 
 /**
  * Get OTA password from NVS. Returns true if a password is set.

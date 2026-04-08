@@ -129,7 +129,20 @@ function niceBytes(x){
 // Global variables
 let currentPath = '/';
 let editor;
+let editorApi;
 let currentEditingFile;
+let monacoLoaderPromise;
+let codeMirrorAssetsPromise;
+let editorLoadPromise;
+let editorResizeBound = false;
+let preferredEditorBackend = 'monaco';
+
+const MONACO_BASE_URL = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min';
+const CODEMIRROR_BASE_URL = '/cm';
+const MONACO_LOAD_TIMEOUT_MS = 3000;
+
+const dynamicScriptPromises = {};
+const dynamicStylePromises = {};
 
 // Path normalization function
 function normalizePath(path) {
@@ -324,6 +337,303 @@ function isTextFile(filename) {
     return textExtensions.some(ext => filename.toLowerCase().endsWith(ext));
 }
 
+function setEditorPlaceholder(message) {
+    if (editorApi) {
+        editorApi.setValue(message);
+        return;
+    }
+
+    const editorElement = document.getElementById('editor');
+    editorElement.innerHTML = `<div style="padding:20px;color:#888;">${message}</div>`;
+}
+
+function loadScriptOnce(src) {
+    if (dynamicScriptPromises[src]) {
+        return dynamicScriptPromises[src];
+    }
+
+    const existing = document.querySelector(`script[data-dynamic-src="${src}"]`);
+    if (existing) {
+        dynamicScriptPromises[src] = Promise.resolve();
+        return dynamicScriptPromises[src];
+    }
+
+    dynamicScriptPromises[src] = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.async = true;
+        script.dataset.dynamicSrc = src;
+        script.onload = () => resolve();
+        script.onerror = () => {
+            delete dynamicScriptPromises[src];
+            reject(new Error(`Failed to load script: ${src}`));
+        };
+        document.head.appendChild(script);
+    });
+
+    return dynamicScriptPromises[src];
+}
+
+function loadStylesheetOnce(href) {
+    if (dynamicStylePromises[href]) {
+        return dynamicStylePromises[href];
+    }
+
+    const existing = document.querySelector(`link[data-dynamic-href="${href}"]`);
+    if (existing) {
+        dynamicStylePromises[href] = Promise.resolve();
+        return dynamicStylePromises[href];
+    }
+
+    dynamicStylePromises[href] = new Promise((resolve, reject) => {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = href;
+        link.dataset.dynamicHref = href;
+        link.onload = () => resolve();
+        link.onerror = () => {
+            delete dynamicStylePromises[href];
+            reject(new Error(`Failed to load stylesheet: ${href}`));
+        };
+        document.head.appendChild(link);
+    });
+
+    return dynamicStylePromises[href];
+}
+
+function withTimeout(promise, timeoutMs, message) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        promise.then(value => {
+            clearTimeout(timer);
+            resolve(value);
+        }, error => {
+            clearTimeout(timer);
+            reject(error);
+        });
+    });
+}
+
+function bindEditorResize() {
+    if (editorResizeBound) {
+        return;
+    }
+
+    window.addEventListener('resize', function() {
+        if (editorApi) {
+            editorApi.layout();
+        }
+    });
+    editorResizeBound = true;
+}
+
+function loadMonacoLoader() {
+    if (window.monaco && window.monaco.editor) {
+        return Promise.resolve();
+    }
+
+    if (typeof window.require === 'function' && window.require.config) {
+        return Promise.resolve();
+    }
+
+    if (monacoLoaderPromise) {
+        return monacoLoaderPromise;
+    }
+
+    monacoLoaderPromise = new Promise((resolve, reject) => {
+        loadScriptOnce(`${MONACO_BASE_URL}/vs/loader.js`).then(resolve).catch(() => {
+            monacoLoaderPromise = null;
+            reject(new Error('Failed to load Monaco loader'));
+        });
+    });
+
+    return monacoLoaderPromise;
+}
+
+function loadCodeMirrorAssets() {
+    if (window.CodeMirror) {
+        return Promise.resolve();
+    }
+
+    if (codeMirrorAssetsPromise) {
+        return codeMirrorAssetsPromise;
+    }
+
+    const modeFiles = [
+        'javascript.min.js',
+        'css.min.js',
+        'xml.min.js',
+        'htmlmixed.min.js',
+        'python.min.js',
+        'clike.min.js',
+        'properties.min.js'
+    ];
+
+    codeMirrorAssetsPromise = Promise.all([
+        loadStylesheetOnce(`${CODEMIRROR_BASE_URL}/codemirror.min.css`),
+        loadStylesheetOnce(`${CODEMIRROR_BASE_URL}/darcula.min.css`)
+    ])
+        .then(() => loadScriptOnce(`${CODEMIRROR_BASE_URL}/codemirror.min.js`))
+        .then(() => modeFiles.reduce((promise, file) => {
+            return promise.then(() => loadScriptOnce(`${CODEMIRROR_BASE_URL}/${file}`));
+        }, Promise.resolve()))
+        .then(() => {
+            if (!window.CodeMirror) {
+                throw new Error('CodeMirror did not initialize');
+            }
+        })
+        .catch(error => {
+            codeMirrorAssetsPromise = null;
+            throw error;
+        });
+
+    return codeMirrorAssetsPromise;
+}
+
+function getCodeMirrorMode(language, extension) {
+    switch (language) {
+    case 'json':
+        return { name: 'javascript', json: true };
+    case 'javascript':
+        return 'javascript';
+    case 'cpp':
+        return 'text/x-c++src';
+    case 'ini':
+        return 'properties';
+    case 'xml':
+        return 'xml';
+    case 'html':
+        return 'htmlmixed';
+    case 'css':
+        return 'css';
+    case 'python':
+        return 'python';
+    default:
+        return 'text/plain';
+    }
+}
+
+function createMonacoEditor() {
+    return loadMonacoLoader()
+        .then(() => new Promise((resolve, reject) => {
+            const requireFn = window.require;
+            if (typeof requireFn !== 'function') {
+                reject(new Error('Monaco loader did not expose require()'));
+                return;
+            }
+
+            requireFn.config({ paths: { 'vs': `${MONACO_BASE_URL}/vs` } });
+            requireFn(['vs/editor/editor.main'], function() {
+                const editorElement = document.getElementById('editor');
+                editorElement.innerHTML = '';
+
+                const monacoInstance = monaco.editor.create(editorElement, {
+                    value: '',
+                    language: 'plaintext',
+                    theme: 'vs-dark',
+                    automaticLayout: true,
+                    scrollBeyondLastLine: false,
+                    lineNumbers: 'on',
+                    lineNumbersMinChars: 3,
+                    minimap: {
+                        enabled: false
+                    },
+                    scrollbar: {
+                        vertical: 'visible',
+                        horizontal: 'visible'
+                    }
+                });
+
+                resolve({
+                    kind: 'monaco',
+                    instance: monacoInstance,
+                    setValue: value => monacoInstance.setValue(value),
+                    getValue: () => monacoInstance.getValue(),
+                    setLanguage: language => {
+                        monaco.editor.setModelLanguage(monacoInstance.getModel(), language);
+                    },
+                    layout: () => monacoInstance.layout(),
+                    focus: () => monacoInstance.focus()
+                });
+            }, function(error) {
+                reject(error || new Error('Failed to load Monaco editor bundle'));
+            });
+        }));
+}
+
+function createCodeMirrorEditor() {
+    return loadCodeMirrorAssets().then(() => {
+        const editorElement = document.getElementById('editor');
+        editorElement.innerHTML = '';
+
+        const textArea = document.createElement('textarea');
+        editorElement.appendChild(textArea);
+
+        const codeMirrorInstance = window.CodeMirror.fromTextArea(textArea, {
+            mode: 'text/plain',
+            theme: 'darcula',
+            lineNumbers: true,
+            lineWrapping: false,
+            indentUnit: 4,
+            tabSize: 4
+        });
+        codeMirrorInstance.setSize('100%', '100%');
+
+        return {
+            kind: 'codemirror',
+            instance: codeMirrorInstance,
+            setValue: value => codeMirrorInstance.setValue(value),
+            getValue: () => codeMirrorInstance.getValue(),
+            setLanguage: (language, extension) => {
+                codeMirrorInstance.setOption('mode', getCodeMirrorMode(language, extension));
+            },
+            layout: () => codeMirrorInstance.refresh(),
+            focus: () => codeMirrorInstance.focus()
+        };
+    });
+}
+
+function ensureEditorReady() {
+    if (editorApi) {
+        return Promise.resolve(editorApi);
+    }
+
+    if (editorLoadPromise) {
+        return editorLoadPromise;
+    }
+
+    editorLoadPromise = (preferredEditorBackend === 'codemirror'
+        ? createCodeMirrorEditor()
+        : withTimeout(createMonacoEditor(), MONACO_LOAD_TIMEOUT_MS, 'Timed out loading Monaco'))
+        .catch(error => {
+            if (preferredEditorBackend === 'codemirror') {
+                throw error;
+            }
+
+            console.warn('Monaco unavailable, loading local CodeMirror fallback:', error);
+            preferredEditorBackend = 'codemirror';
+            setEditorPlaceholder('Loading local fallback editor...');
+            return createCodeMirrorEditor();
+        })
+        .then(api => {
+            editorApi = api;
+            editor = api.instance;
+            bindEditorResize();
+            setTimeout(() => {
+                if (editorApi) {
+                    editorApi.layout();
+                }
+            }, 100);
+            return api;
+        })
+        .catch(error => {
+            editorLoadPromise = null;
+            throw error;
+        });
+
+    return editorLoadPromise;
+}
+
 document.addEventListener('DOMContentLoaded', function() {
     // SD access toggle
     const sdToggle = document.getElementById('sdAccessToggle');
@@ -375,41 +685,6 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     });
 
-    // Initialize Monaco Editor
-    require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' }});
-    require(['vs/editor/editor.main'], function() {
-		editor = monaco.editor.create(document.getElementById('editor'), {
-			value: '',
-			language: 'plaintext',
-			theme: 'vs-dark',
-			automaticLayout: true,
-			scrollBeyondLastLine: false,
-			minimap: {
-				enabled: false
-			},
-			scrollbar: {
-				vertical: 'visible',
-				horizontal: 'visible'
-			},
-			dimension: {
-				width: document.getElementById('editor').clientWidth,
-				height: document.getElementById('editor').clientHeight
-			}
-		});
-
-		setTimeout(() => {
-			if (editor) {
-				editor.layout();
-			}
-		}, 100);
-
-		window.addEventListener('resize', function() {
-			if (editor) {
-				editor.layout();
-			}
-		});
-	});
-
     // Don't auto-fetch — the sd_access check above will fetchDirectory if enabled
     document.getElementById('filelistbox').innerHTML =
         '<p style="padding:10px;color:#888;">SD access disabled — enable to browse files.</p>';
@@ -437,21 +712,45 @@ function openEditor(filePath) {
     currentEditingFile = filePath;
     
     const modal = document.getElementById('editorModal');
+    const saveButton = document.getElementById('saveFileButton');
     modal.style.display = 'block';
-    editor.setValue('Loading...');
-    
-    fetch(`/download?path=${encodeURIComponent(filePath)}`)
-        .then(response => response.text())
-        .then(content => {
+    saveButton.disabled = true;
+    setEditorPlaceholder('Loading editor...');
+
+    ensureEditorReady()
+        .then(api => {
+            if (currentEditingFile !== filePath) {
+                return null;
+            }
+
+            api.setValue('Loading file...');
+            return fetch(`/download?path=${encodeURIComponent(filePath)}`)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    return response.text();
+                })
+                .then(content => ({ api, content }));
+        })
+        .then(result => {
+            if (!result || currentEditingFile !== filePath) {
+                return;
+            }
+
             // Set the editor language based on file extension
             const ext = filePath.split('.').pop().toLowerCase();
             const language = getEditorLanguage(ext);
-            monaco.editor.setModelLanguage(editor.getModel(), language);
+            result.api.setLanguage(language, ext);
             
-            editor.setValue(content);
+            result.api.setValue(result.content);
+            result.api.layout();
+            result.api.focus();
+            saveButton.disabled = false;
         })
         .catch(error => {
             console.error('Error loading file:', error);
+            saveButton.disabled = false;
             alert('Failed to load file for editing.');
             closeEditor();
         });
@@ -462,7 +761,12 @@ function closeEditor() {
 }
 
 function saveFile() {
-    const content = editor.getValue();
+    if (!editorApi || !currentEditingFile) {
+        alert('Editor is still loading. Please try again in a moment.');
+        return;
+    }
+
+    const content = editorApi.getValue();
     
     const blob = new Blob([content], { type: 'text/plain' });
     const file = new File([blob], currentEditingFile.split('/').pop());
