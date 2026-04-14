@@ -1,4 +1,4 @@
-#include "web_server.h"
+﻿#include "web_server.h"
 #include "sd_control.h"
 #include "network.h"
 #include "rt4k_config.h"
@@ -16,9 +16,12 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_partition.h"
+#include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "esp_timer.h"
 
 static const char *TAG = "webserver";
@@ -28,13 +31,35 @@ static httpd_handle_t s_server = NULL;
 #define FILE_BUF_SIZE 4096
 #define SMALL_POST_BODY_MAX 1024
 #define MODELINE_POST_BODY_MAX (12 * 1024)
-#define MODELINE_CONTENT_MAX   (8 * 1024)
 
-/* Upload async writer configuration */
-#define UPLOAD_RECV_BUF_SIZE   4096      /* Network recv chunk */
-#define UPLOAD_RING_SLOTS      4         /* Number of ring buffer slots */
-#define UPLOAD_RING_SLOT_SIZE  (16384)   /* 16KB per slot */
-#define UPLOAD_WRITER_STACK    4096      /* Writer task stack */
+#define LOG_STREAM_SIZE 2048
+
+static StreamBufferHandle_t s_log_stream = NULL;
+static volatile int s_ws_log_fd = -1;   /* -1 = no client */
+static vprintf_like_t s_orig_vprintf = NULL;
+
+static int log_vprintf_hook(const char *fmt, va_list args)
+{
+    /* Fast path: no client, zero overhead */
+    if (s_ws_log_fd < 0) {
+        return s_orig_vprintf(fmt, args);
+    }
+
+    char tmp[256];
+    va_list copy;
+    va_copy(copy, args);
+    int len = vsnprintf(tmp, sizeof(tmp), fmt, copy);
+    va_end(copy);
+
+    if (len > 0 && s_log_stream) {
+        size_t n = (len < (int)sizeof(tmp)) ? (size_t)len : sizeof(tmp) - 1;
+        /* Non-blocking: silently drops if buffer full — fine for debug */
+        xStreamBufferSend(s_log_stream, tmp, n, 0);
+    }
+
+    return s_orig_vprintf(fmt, args);
+}
+#define MODELINE_CONTENT_MAX   (8 * 1024)
 
 /* SPIFFS mount point for static web assets */
 #define SPIFFS_MOUNT "/spiffs"
@@ -462,247 +487,80 @@ static esp_err_t handle_rename(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* ─── /upload ─────────────────────────────────────────────────────── */
-
+/* ─── Upload: /upload_begin … /upload_end ──────── */
 /*
- * Async upload handler with producer-consumer architecture.
+ * Two-phase upload protocol optimised to separate WiFi receive
+ * from SD write:
  *
- * The HTTP handler task receives data from the network into a ring buffer.
- * A separate writer task drains the ring buffer to the SD card in large
- * (UPLOAD_RING_SLOT_SIZE) writes, keeping the TCP window open while
- * the SD card is busy.
+ *   Phase 1 – receive entire chunk body into a 32 KiB RAM buffer
+ *             (WiFi active, SD idle).
+ *   Phase 2 – write buffer to SD in a single fwrite()
+ *             (SD active, WiFi idle / sleeping).
  *
- * Supports two modes:
- *   1. Raw body:  POST /upload?path=/dir&filename=foo.bin
- *      Content-Type: application/octet-stream — skips multipart overhead.
- *   2. Multipart: POST /upload?path=/dir  with multipart/form-data body.
- *      Headers are parsed synchronously; file data streams through the ring.
+ * The HTTP response is not sent until Phase 2 completes, so the
+ * client naturally paces itself — no artificial inter-chunk delays
+ * needed.
  */
 
-/* ── Ring buffer shared between recv (producer) and writer (consumer) ── */
+#define UPLOAD_BUF_SIZE     (32 * 1024)           /* 32 KiB accumulation buffer */
+#define UPLOAD_TIMEOUT_US   (30LL * 1000000)      /* 30 s stale-session guard   */
 
-typedef struct {
-    char   *slots;                         /* UPLOAD_RING_SLOTS × UPLOAD_RING_SLOT_SIZE */
-    size_t  slot_len[UPLOAD_RING_SLOTS];   /* bytes valid in each slot */
-    int     wr;                            /* next slot producer fills */
-    int     rd;                            /* next slot consumer writes to SD */
-    SemaphoreHandle_t full;                /* counts slots ready to write */
-    SemaphoreHandle_t empty;               /* counts free slots */
-    SemaphoreHandle_t writer_done;         /* signaled by writer before exit */
-    bool    done;                          /* producer sets when finished */
-    bool    error;                         /* set by either side on failure */
-    const char *error_msg;
-    char    file_path[512];                /* full VFS path for writer to open */
-    int64_t write_us;                      /* total SD write time (µs) */
-} upload_ring_t;
+static FILE    *s_ul_fp        = NULL;
+static char     s_ul_path[512] = "";
+static int64_t  s_ul_bytes     = 0;
+static int64_t  s_ul_write_us  = 0;
+static int64_t  s_ul_recv_us   = 0;
+static int64_t  s_ul_last_us   = 0;
+static char    *s_ul_buf       = NULL;   /* 32 KiB buffer, allocated on begin */
 
-/* Writer task: runs on its own stack, writes ring slots to SD */
-static void upload_writer_task(void *arg)
+static void upload_cleanup(void)
 {
-    upload_ring_t *ring = (upload_ring_t *)arg;
-    FILE *f = NULL;
-
-    /* Open file for writing */
-    unlink(ring->file_path);
-    f = fopen(ring->file_path, "wb");
-    if (!f) {
-        ESP_LOGE(TAG, "Writer: failed to open %s", ring->file_path);
-        ring->error = true;
-        ring->error_msg = "UPLOAD:OPEN";
-        /* Drain all pending signals so producer doesn't block forever */
-        while (!ring->done || xSemaphoreTake(ring->full, 0) == pdTRUE) {
-            xSemaphoreGive(ring->empty);
-            if (!ring->done) xSemaphoreTake(ring->full, pdMS_TO_TICKS(100));
-        }
-        xSemaphoreGive(ring->writer_done);
-        vTaskDelete(NULL);
-        return;
+    if (s_ul_fp) { fclose(s_ul_fp); s_ul_fp = NULL; }
+    if (s_ul_path[0]) {
+        unlink(s_ul_path);
+        sd_control_unhold();
+        sd_control_relinquish();
+        s_ul_path[0] = '\0';
     }
-
-    ESP_LOGI(TAG, "Writer: writing to %s", ring->file_path);
-
-    while (true) {
-        /* Wait for a full slot (with timeout so we can detect completion) */
-        if (xSemaphoreTake(ring->full, pdMS_TO_TICKS(200)) != pdTRUE) {
-            if (ring->done || ring->error) break;
-            continue;
-        }
-
-        if (ring->error) {
-            xSemaphoreGive(ring->empty);
-            break;
-        }
-
-        size_t len = ring->slot_len[ring->rd];
-        if (len > 0) {
-            int64_t t0 = esp_timer_get_time();
-            size_t written = fwrite(ring->slots + (ring->rd * UPLOAD_RING_SLOT_SIZE), 1, len, f);
-            ring->write_us += esp_timer_get_time() - t0;
-
-            if (written != len) {
-                ESP_LOGE(TAG, "Writer: short write (%u/%u)", written, len);
-                ring->error = true;
-                ring->error_msg = "UPLOAD:WRITE";
-                xSemaphoreGive(ring->empty);
-                break;
-            }
-        }
-
-        ring->rd = (ring->rd + 1) % UPLOAD_RING_SLOTS;
-        xSemaphoreGive(ring->empty);
-    }
-
-    if (f) {
-        if (fclose(f) != 0 && !ring->error) {
-            ESP_LOGE(TAG, "Writer: fclose failed");
-            ring->error = true;
-            ring->error_msg = "UPLOAD:CLOSE";
-        }
-    }
-
-    /* Drain remaining signals so producer unblocks */
-    while (xSemaphoreTake(ring->full, 0) == pdTRUE) {
-        xSemaphoreGive(ring->empty);
-    }
-
-    xSemaphoreGive(ring->writer_done);
-    vTaskDelete(NULL);
+    if (s_ul_buf) { free(s_ul_buf); s_ul_buf = NULL; }
+    s_ul_bytes = s_ul_write_us = s_ul_recv_us = s_ul_last_us = 0;
 }
 
-/* Push data into the ring buffer, splitting across slot boundaries */
-static bool ring_push(upload_ring_t *ring, const char *data, size_t len)
+static void upload_check_timeout(void)
 {
-    while (len > 0 && !ring->error) {
-        size_t slot_used = ring->slot_len[ring->wr];
-        size_t space = UPLOAD_RING_SLOT_SIZE - slot_used;
-
-        if (space == 0) {
-            /* Current slot full — hand to writer */
-            xSemaphoreGive(ring->full);
-            /* Wait for a free slot */
-            while (xSemaphoreTake(ring->empty, pdMS_TO_TICKS(200)) != pdTRUE) {
-                if (ring->error) return false;
-            }
-            ring->wr = (ring->wr + 1) % UPLOAD_RING_SLOTS;
-            ring->slot_len[ring->wr] = 0;
-            slot_used = 0;
-            space = UPLOAD_RING_SLOT_SIZE;
-        }
-
-        size_t chunk = len < space ? len : space;
-        memcpy(ring->slots + (ring->wr * UPLOAD_RING_SLOT_SIZE) + slot_used, data, chunk);
-        ring->slot_len[ring->wr] += chunk;
-        data += chunk;
-        len -= chunk;
-    }
-    return !ring->error;
-}
-
-/* Flush the current partially-filled slot to the writer */
-static void ring_flush(upload_ring_t *ring)
-{
-    if (ring->slot_len[ring->wr] > 0) {
-        xSemaphoreGive(ring->full);
-        /* Wait for writer to consume it */
-        while (xSemaphoreTake(ring->empty, pdMS_TO_TICKS(200)) != pdTRUE) {
-            if (ring->error) return;
-        }
-        ring->wr = (ring->wr + 1) % UPLOAD_RING_SLOTS;
-        ring->slot_len[ring->wr] = 0;
+    if (s_ul_fp && s_ul_last_us > 0 &&
+        (esp_timer_get_time() - s_ul_last_us) > UPLOAD_TIMEOUT_US) {
+        ESP_LOGW(TAG, "Upload session timed out — cleaning up");
+        upload_cleanup();
     }
 }
 
-/* Find a substring in a buffer (not null-terminated) */
-static const char *memmem_find(const char *haystack, size_t hlen,
-                               const char *needle, size_t nlen)
-{
-    if (nlen > hlen) return NULL;
-    for (size_t i = 0; i <= hlen - nlen; i++) {
-        if (memcmp(haystack + i, needle, nlen) == 0)
-            return haystack + i;
-    }
-    return NULL;
-}
-
-/*
- * Drain multipart preamble + headers from the request, returning the
- * extracted filename.  Returns bytes of leftover data already read
- * past the header that belong to the file body, stored in `leftover`.
- * Returns -1 on error.
- */
-static int multipart_drain_headers(httpd_req_t *req, const char *boundary,
-                                   size_t boundary_len, int *remaining,
-                                   char *filename, size_t fname_size,
-                                   char *leftover, size_t leftover_cap)
-{
-    /* Small buffer to accumulate preamble+headers (typically < 512 bytes) */
-    char hdr_buf[1024];
-    size_t hdr_len = 0;
-
-    while (*remaining > 0 && hdr_len < sizeof(hdr_buf) - 1) {
-        int to_recv = *remaining < (int)(sizeof(hdr_buf) - hdr_len)
-                      ? *remaining : (int)(sizeof(hdr_buf) - hdr_len);
-        int received = httpd_req_recv(req, hdr_buf + hdr_len, to_recv);
-        if (received <= 0) {
-            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
-            return -1;
-        }
-        *remaining -= received;
-        hdr_len += received;
-
-        /* Look for boundary followed by headers ending with \r\n\r\n */
-        const char *bnd = memmem_find(hdr_buf, hdr_len, boundary, boundary_len);
-        if (!bnd) continue;
-
-        /* Find end-of-headers after boundary */
-        size_t after_bnd = (bnd - hdr_buf) + boundary_len;
-        /* Skip CRLF after boundary */
-        if (after_bnd + 2 <= hdr_len && hdr_buf[after_bnd] == '\r' && hdr_buf[after_bnd + 1] == '\n')
-            after_bnd += 2;
-
-        const char *hdr_end = memmem_find(hdr_buf + after_bnd, hdr_len - after_bnd, "\r\n\r\n", 4);
-        if (!hdr_end) continue;
-
-        /* Extract filename from Content-Disposition */
-        size_t headers_region = hdr_end - (hdr_buf + after_bnd);
-        const char *fn_start = memmem_find(hdr_buf + after_bnd, headers_region, "filename=\"", 10);
-        if (fn_start) {
-            fn_start += 10;
-            const char *fn_end = memchr(fn_start, '"', headers_region - (fn_start - (hdr_buf + after_bnd)));
-            if (fn_end) {
-                size_t flen = fn_end - fn_start;
-                if (flen >= fname_size) flen = fname_size - 1;
-                memcpy(filename, fn_start, flen);
-                filename[flen] = '\0';
-            }
-        }
-
-        /* Everything after \r\n\r\n is file data */
-        size_t body_start = (hdr_end - hdr_buf) + 4;
-        size_t leftover_len = hdr_len - body_start;
-        if (leftover_len > leftover_cap) leftover_len = leftover_cap;
-        memcpy(leftover, hdr_buf + body_start, leftover_len);
-        return (int)leftover_len;
-    }
-
-    return -1; /* headers too large or recv failed */
-}
-
-static esp_err_t handle_upload(httpd_req_t *req)
+/* POST /upload_begin?path=/dir&filename=foo.bin */
+static esp_err_t handle_upload_begin(httpd_req_t *req)
 {
     set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    upload_check_timeout();
+    if (s_ul_fp) {
+        ESP_LOGW(TAG, "Aborting previous upload session");
+        upload_cleanup();
+    }
+
     if (sd_control_can_take() != 0) {
-        httpd_resp_set_status(req, "500");
-        httpd_resp_sendstr(req, "UPLOAD:SDBUSY");
+        httpd_resp_set_status(req, "503");
+        httpd_resp_sendstr(req, "{\"error\":\"SDBUSY\"}");
         return ESP_OK;
     }
 
-    /* ── Determine upload mode: raw vs multipart ── */
-    char content_type[128] = "";
-    httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type));
-    bool is_raw = (strstr(content_type, "multipart") == NULL);
+    /* Allocate 32 KiB accumulation buffer */
+    s_ul_buf = heap_caps_malloc(UPLOAD_BUF_SIZE, MALLOC_CAP_8BIT);
+    if (!s_ul_buf) {
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "{\"error\":\"NOMEM\"}");
+        return ESP_OK;
+    }
 
-    /* Get upload path from query string */
     char upload_dir[256] = "/";
     get_query_param(req, "path", upload_dir, sizeof(upload_dir));
     url_decode(upload_dir);
@@ -711,33 +569,26 @@ static esp_err_t handle_upload(httpd_req_t *req)
         upload_dir[0] = '/';
     }
 
-    /* For raw mode, filename comes from query param */
     char filename[128] = "";
-    if (is_raw) {
-        if (get_query_param(req, "filename", filename, sizeof(filename)) < 0) {
-            httpd_resp_set_status(req, "400");
-            httpd_resp_sendstr(req, "UPLOAD:NOFILENAME");
-            return ESP_OK;
-        }
-        url_decode(filename);
+    if (get_query_param(req, "filename", filename, sizeof(filename)) < 0) {
+        free(s_ul_buf); s_ul_buf = NULL;
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "{\"error\":\"NOFILENAME\"}");
+        return ESP_OK;
     }
-
-    /* Multipart: extract boundary */
-    char boundary[128] = "";
-    size_t boundary_len = 0;
-    if (!is_raw) {
-        const char *bs = strstr(content_type, "boundary=");
-        if (!bs) {
-            httpd_resp_set_status(req, "400");
-            httpd_resp_sendstr(req, "UPLOAD:NOBOUNDARY");
-            return ESP_OK;
-        }
-        bs += 9;
-        snprintf(boundary, sizeof(boundary), "--%s", bs);
-        boundary_len = strlen(boundary);
-    }
+    url_decode(filename);
 
     sd_control_take();
+    sd_control_hold();
+
+    if (!sd_control_we_have_control()) {
+        ESP_LOGE(TAG, "Upload: SD mount failed");
+        sd_control_unhold();
+        free(s_ul_buf); s_ul_buf = NULL;
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "{\"error\":\"MOUNT\"}");
+        return ESP_OK;
+    }
 
     /* Ensure upload directory exists */
     if (strcmp(upload_dir, "/") != 0) {
@@ -748,202 +599,173 @@ static esp_err_t handle_upload(httpd_req_t *req)
         mkdir(dir_full, 0775);
     }
 
-    /* ── Allocate ring buffer ── */
-    upload_ring_t ring = {0};
-    ring.slots = heap_caps_malloc(UPLOAD_RING_SLOTS * UPLOAD_RING_SLOT_SIZE, MALLOC_CAP_8BIT);
-    if (!ring.slots) {
+    /* Build full path */
+    if (upload_dir[strlen(upload_dir) - 1] == '/')
+        snprintf(s_ul_path, sizeof(s_ul_path), "%s%s%s",
+                 SD_MOUNT_POINT, upload_dir, filename);
+    else
+        snprintf(s_ul_path, sizeof(s_ul_path), "%s%s/%s",
+                 SD_MOUNT_POINT, upload_dir, filename);
+
+    unlink(s_ul_path);
+    s_ul_fp = fopen(s_ul_path, "wb");
+    if (!s_ul_fp) {
+        ESP_LOGE(TAG, "Upload: failed to open %s", s_ul_path);
+        sd_control_unhold();
         sd_control_relinquish();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        s_ul_path[0] = '\0';
+        free(s_ul_buf); s_ul_buf = NULL;
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "{\"error\":\"OPEN\"}");
         return ESP_OK;
     }
-    ring.full  = xSemaphoreCreateCounting(UPLOAD_RING_SLOTS, 0);
-    ring.empty = xSemaphoreCreateCounting(UPLOAD_RING_SLOTS, UPLOAD_RING_SLOTS);
-    ring.writer_done = xSemaphoreCreateBinary();
-    ring.error_msg = "UPLOAD:FAILED";
 
-    /* Build output file path */
+    /* Bypass stdio buffering — our 32 KiB writes go straight to VFS */
+    setvbuf(s_ul_fp, NULL, _IONBF, 0);
+
+    s_ul_bytes = s_ul_write_us = s_ul_recv_us = 0;
+    s_ul_last_us = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "Upload started: %s (32 KiB buffered writes)", s_ul_path);
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /upload_chunk  (body = raw bytes, max 32 KiB) */
+static esp_err_t handle_upload_chunk(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    if (!s_ul_fp || !s_ul_buf) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "{\"error\":\"NOSESSION\"}");
+        return ESP_OK;
+    }
+
+    s_ul_last_us = esp_timer_get_time();
+    int64_t chunk_start_us = s_ul_last_us;
+    int64_t deadline = s_ul_last_us + UPLOAD_TIMEOUT_US;
+
     int remaining = req->content_len;
-    char file_full[512] = "";
-    const char *error_msg = "UPLOAD:FAILED";
-    bool upload_failed = false;
+    if (remaining > UPLOAD_BUF_SIZE) {
+        httpd_resp_set_status(req, "413");
+        httpd_resp_sendstr(req, "{\"error\":\"TOOLARGE\"}");
+        return ESP_OK;
+    }
 
-    /* For multipart, parse headers to get filename */
-    char *leftover_buf = NULL;
-    int leftover_len = 0;
+    /* ── Phase 1: recv entire body into RAM (WiFi active, SD idle) ── */
+    int64_t recv_start = esp_timer_get_time();
+    int buf_offset = 0;
 
-    if (!is_raw) {
-        leftover_buf = malloc(UPLOAD_RECV_BUF_SIZE);
-        if (!leftover_buf) {
-            free(ring.slots);
-            vSemaphoreDelete(ring.full);
-            vSemaphoreDelete(ring.empty);
-            vSemaphoreDelete(ring.writer_done);
-            sd_control_relinquish();
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    while (remaining > 0) {
+        if (esp_timer_get_time() > deadline) {
+            ESP_LOGE(TAG, "Upload: recv timeout");
+            upload_cleanup();
+            httpd_resp_set_status(req, "500");
+            httpd_resp_sendstr(req, "{\"error\":\"TIMEOUT\"}");
             return ESP_OK;
         }
 
-        leftover_len = multipart_drain_headers(req, boundary, boundary_len,
-                                                &remaining, filename, sizeof(filename),
-                                                leftover_buf, UPLOAD_RECV_BUF_SIZE);
-        if (leftover_len < 0 || filename[0] == '\0') {
-            upload_failed = true;
-            error_msg = "UPLOAD:HEADERS";
+        int received = httpd_req_recv(req, s_ul_buf + buf_offset, remaining);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ESP_LOGE(TAG, "Upload: recv error");
+            upload_cleanup();
+            httpd_resp_set_status(req, "500");
+            httpd_resp_sendstr(req, "{\"error\":\"RECV\"}");
+            return ESP_OK;
         }
+        buf_offset += received;
+        remaining  -= received;
     }
 
-    if (!upload_failed && filename[0] == '\0') {
-        upload_failed = true;
-        error_msg = "UPLOAD:NOFILE";
-    }
+    int64_t recv_us = esp_timer_get_time() - recv_start;
+    s_ul_recv_us += recv_us;
 
-    if (!upload_failed) {
-        if (upload_dir[strlen(upload_dir) - 1] == '/') {
-            snprintf(file_full, sizeof(file_full), "%s%s%s",
-                     SD_MOUNT_POINT, upload_dir, filename);
-        } else {
-            snprintf(file_full, sizeof(file_full), "%s%s/%s",
-                     SD_MOUNT_POINT, upload_dir, filename);
-        }
-        snprintf(ring.file_path, sizeof(ring.file_path), "%s", file_full);
+    /* ── Phase 2: write buffer to SD in one shot (SD active, WiFi idle) ── */
+    int64_t write_start = esp_timer_get_time();
+    size_t wr = fwrite(s_ul_buf, 1, buf_offset, s_ul_fp);
+    int64_t write_us = esp_timer_get_time() - write_start;
+    s_ul_write_us += write_us;
 
-        /* Take an empty slot for initial filling */
-        xSemaphoreTake(ring.empty, portMAX_DELAY);
-        ring.slot_len[0] = 0;
-
-        /* Start writer task */
-        TaskHandle_t writer = NULL;
-        if (xTaskCreate(upload_writer_task, "upld_wr", UPLOAD_WRITER_STACK,
-                        &ring, tskIDLE_PRIORITY + 2, &writer) != pdPASS) {
-            upload_failed = true;
-            error_msg = "UPLOAD:TASK";
-            xSemaphoreGive(ring.empty);
-        }
-    }
-
-    bool writer_started = !upload_failed;
-    int64_t recv_us = 0;
-    int64_t total_bytes = 0;
-
-    /* ── Push leftover header data into ring ── */
-    if (!upload_failed && !is_raw && leftover_len > 0) {
-        /* For multipart, we need to watch for the closing boundary in the tail.
-         * The closing boundary "\r\n--boundary--" is at the very end of the body.
-         * We know 'remaining' bytes are left, and the tail contains the boundary.
-         * We'll trim the boundary from the data at the end. */
-        if (!ring_push(&ring, leftover_buf, leftover_len)) {
-            upload_failed = true;
-            error_msg = ring.error_msg;
-        }
-        total_bytes += leftover_len;
-    }
-
-    free(leftover_buf);
-    leftover_buf = NULL;
-
-    /* ── Main recv loop: read from network → push into ring ── */
-    if (!upload_failed) {
-        char *recv_buf = malloc(UPLOAD_RECV_BUF_SIZE);
-        if (!recv_buf) {
-            upload_failed = true;
-            error_msg = "UPLOAD:NOMEM";
-        } else {
-            while (remaining > 0 && !upload_failed && !ring.error) {
-                int to_recv = remaining < (int)UPLOAD_RECV_BUF_SIZE ? remaining : (int)UPLOAD_RECV_BUF_SIZE;
-                int64_t t0 = esp_timer_get_time();
-                int received = httpd_req_recv(req, recv_buf, to_recv);
-                recv_us += esp_timer_get_time() - t0;
-
-                if (received <= 0) {
-                    if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
-                    upload_failed = true;
-                    error_msg = "UPLOAD:RECV";
-                    break;
-                }
-                remaining -= received;
-
-                if (!ring_push(&ring, recv_buf, received)) {
-                    upload_failed = true;
-                    error_msg = ring.error_msg;
-                    break;
-                }
-                total_bytes += received;
-            }
-            free(recv_buf);
-        }
-    }
-
-    /* ── Signal writer we're done ── */
-    if (writer_started) {
-        ring_flush(&ring);
-        ring.done = true;
-        /* Give one more signal to wake writer if it's waiting */
-        xSemaphoreGive(ring.full);
-
-        /* Wait for writer task to finish */
-        xSemaphoreTake(ring.writer_done, pdMS_TO_TICKS(10000));
-    }
-
-    if (ring.error && !upload_failed) {
-        upload_failed = true;
-        error_msg = ring.error_msg;
-    }
-
-    /* ── For multipart, the data we pushed includes the closing boundary.
-     *    The file on disk has the trailing "\r\n--boundary--\r\n" appended.
-     *    Truncate it off. ── */
-    if (!upload_failed && !is_raw && boundary_len > 0) {
-        struct stat st;
-        if (stat(file_full, &st) == 0 && st.st_size > 0) {
-            /* Closing boundary = "\r\n" + boundary + "--" + optional "\r\n"
-             * We need to find exactly where it starts and truncate. */
-            size_t tail_max = boundary_len + 8; /* \r\n + boundary + -- + \r\n */
-            if ((size_t)st.st_size > tail_max) {
-                FILE *f = fopen(file_full, "r+b");
-                if (f) {
-                    char tail[256];
-                    size_t to_read = tail_max < sizeof(tail) ? tail_max : sizeof(tail);
-                    long seek_pos = st.st_size - (long)to_read;
-                    fseek(f, seek_pos, SEEK_SET);
-                    size_t got = fread(tail, 1, to_read, f);
-                    /* Find "\r\n--boundary" in the tail */
-                    const char *bnd = memmem_find(tail, got, boundary, boundary_len);
-                    if (bnd) {
-                        long trim_pos = seek_pos + (bnd - tail);
-                        /* Also trim preceding \r\n */
-                        if (trim_pos >= 2) trim_pos -= 2;
-                        fclose(f);
-                        truncate(file_full, trim_pos);
-                    } else {
-                        fclose(f);
-                    }
-                }
-            }
-        }
-    }
-
-    /* ── Clean up ── */
-    free(ring.slots);
-    vSemaphoreDelete(ring.full);
-    vSemaphoreDelete(ring.empty);
-    vSemaphoreDelete(ring.writer_done);
-    sd_control_relinquish();
-
-    if (upload_failed) {
-        if (file_full[0] != '\0') unlink(file_full);
+    if ((int)wr != buf_offset) {
+        ESP_LOGE(TAG, "Upload: short write (%u/%d)", (unsigned)wr, buf_offset);
+        upload_cleanup();
         httpd_resp_set_status(req, "500");
-        httpd_resp_sendstr(req, error_msg);
-        ESP_LOGW(TAG, "Upload failed: %s", error_msg);
+        httpd_resp_sendstr(req, "{\"error\":\"WRITE\"}");
+        return ESP_OK;
+    }
+    s_ul_bytes += wr;
+
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"written\":%lld,\"recv_ms\":%lld,\"write_ms\":%lld,\"elapsed_ms\":%lld}",
+             s_ul_bytes, recv_us / 1000, write_us / 1000,
+             (esp_timer_get_time() - chunk_start_us) / 1000);
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+/* POST /upload_end */
+static esp_err_t handle_upload_end(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    if (!s_ul_fp) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "{\"error\":\"NOSESSION\"}");
         return ESP_OK;
     }
 
-    /* Log timing stats */
-    int64_t total_us = recv_us + ring.write_us;
-    ESP_LOGI(TAG, "Upload complete: %lld bytes, recv=%lldms write=%lldms total=%lldms (%.0f KiB/s)",
-             total_bytes, recv_us / 1000, ring.write_us / 1000, total_us / 1000,
-             total_us > 0 ? (double)total_bytes / 1024.0 * 1000000.0 / (double)total_us : 0.0);
+    bool close_ok = (fclose(s_ul_fp) == 0);
+    s_ul_fp = NULL;
 
-    httpd_resp_sendstr(req, "ok");
+    sd_control_unhold();
+    sd_control_relinquish();
+
+    free(s_ul_buf);
+    s_ul_buf = NULL;
+
+    if (!close_ok) {
+        ESP_LOGE(TAG, "Upload: fclose failed");
+        unlink(s_ul_path);
+        s_ul_path[0] = '\0';
+        httpd_resp_set_status(req, "500");
+        httpd_resp_sendstr(req, "{\"error\":\"CLOSE\"}");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Upload complete: %lld bytes, recv=%lldms write=%lldms (%.0f KiB/s write)",
+             s_ul_bytes, s_ul_recv_us / 1000, s_ul_write_us / 1000,
+             s_ul_write_us > 0
+               ? (double)s_ul_bytes / 1024.0 * 1000000.0 / (double)s_ul_write_us
+               : 0.0);
+
+    char resp[192];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"total\":%lld,\"recv_ms\":%lld,\"write_ms\":%lld}",
+             s_ul_bytes, s_ul_recv_us / 1000, s_ul_write_us / 1000);
+    httpd_resp_sendstr(req, resp);
+
+    s_ul_path[0] = '\0';
+    s_ul_bytes = s_ul_write_us = s_ul_recv_us = s_ul_last_us = 0;
+    return ESP_OK;
+}
+
+/* POST /upload_abort */
+static esp_err_t handle_upload_abort(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    if (s_ul_fp) {
+        ESP_LOGW(TAG, "Upload aborted by client");
+        upload_cleanup();
+    }
+
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -1180,9 +1002,10 @@ static esp_err_t handle_sd_access_get(httpd_req_t *req)
 {
     set_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    char resp[64];
-    snprintf(resp, sizeof(resp), "{\"enabled\":%s}",
-             sd_control_is_access_enabled() ? "true" : "false");
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"enabled\":%s,\"esp_exclusive\":%s}",
+             sd_control_is_access_enabled() ? "true" : "false",
+             sd_control_is_esp_exclusive() ? "true" : "false");
     httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
@@ -1219,6 +1042,46 @@ static esp_err_t handle_sd_access_post(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"error\":\"Failed to mount SD card\"}");
     }
 
+    return ESP_OK;
+}
+
+
+/* ─── /sd_esp_exclusive ────────────────────────────────────────────── */
+
+static esp_err_t handle_sd_esp_exclusive_get(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"esp_exclusive\":%s}",
+             sd_control_is_esp_exclusive() ? "true" : "false");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static esp_err_t handle_sd_esp_exclusive_post(httpd_req_t *req)
+{
+    set_cors_headers(req);
+
+    char *body = NULL;
+    if (read_post_body(req, &body, SMALL_POST_BODY_MAX) < 0) {
+        httpd_resp_set_status(req, "400");
+        httpd_resp_sendstr(req, "Missing body");
+        return ESP_OK;
+    }
+
+    char val[8] = "";
+    parse_form_field(body, "enable", val, sizeof(val));
+    free(body);
+
+    bool enable = (strcmp(val, "1") == 0 || strcmp(val, "true") == 0);
+    sd_control_set_esp_exclusive(enable);
+
+    httpd_resp_set_type(req, "application/json");
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"esp_exclusive\":%s}",
+             sd_control_is_esp_exclusive() ? "true" : "false");
+    httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
 
@@ -1536,16 +1399,185 @@ static esp_err_t handle_options(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ─── WebSocket log streaming ─────────────────────────────────────── */
+
+static esp_err_t handle_ws_logs(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        /* Upgrade handshake — activate log capture */
+        int fd = httpd_req_to_sockfd(req);
+
+        /* Create stream buffer on first connect (or if previous was freed) */
+        if (!s_log_stream) {
+            s_log_stream = xStreamBufferCreate(LOG_STREAM_SIZE, 1);
+            if (!s_log_stream) {
+                ESP_LOGE(TAG, "Failed to create log stream buffer");
+                return ESP_FAIL;
+            }
+        } else {
+            /* New client replaces old — flush stale data */
+            xStreamBufferReset(s_log_stream);
+        }
+        s_ws_log_fd = fd;
+        ESP_LOGI(TAG, "WS log client connected: fd=%d", fd);
+        return ESP_OK;
+    }
+
+    /* Receive incoming frame (poll request) */
+    httpd_ws_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.type = HTTPD_WS_TYPE_TEXT;
+
+    esp_err_t ret = httpd_ws_recv_frame(req, &frame, 0);
+    if (ret != ESP_OK) {
+        s_ws_log_fd = -1;
+        return ret;
+    }
+
+    /* Consume payload if any */
+    if (frame.len > 0 && frame.len < 64) {
+        uint8_t discard[64];
+        frame.payload = discard;
+        httpd_ws_recv_frame(req, &frame, sizeof(discard));
+    }
+
+    /* Read available log data and send */
+    if (s_log_stream) {
+        char buf[1024];
+        size_t n = xStreamBufferReceive(s_log_stream, buf, sizeof(buf), 0);
+
+        if (n > 0) {
+            httpd_ws_frame_t resp = {
+                .type = HTTPD_WS_TYPE_TEXT,
+                .payload = (uint8_t *)buf,
+                .len = n,
+            };
+            ret = httpd_ws_send_frame(req, &resp);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "WS send failed fd=%d, disconnecting", s_ws_log_fd);
+                s_ws_log_fd = -1;
+            }
+        }
+    }
+    return ESP_OK;
+}
+
+/* ─── SD reprobe ──────────────────────────────────────────────────── */
+
+static esp_err_t handle_sd_reprobe(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t err = sd_control_reprobe();
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":%s,\"sd_bus\":\"%s\",\"probe_log\":\"%s\"}",
+             err == ESP_OK ? "true" : "false",
+             sd_control_get_bus_mode(),
+             sd_control_get_probe_log());
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+/* ─── Device info ─────────────────────────────────────────────────── */
+
+static esp_err_t handle_device_info(httpd_req_t *req)
+{
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    /* Uptime */
+    int64_t uptime_us = esp_timer_get_time();
+    uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
+    uint32_t days  = uptime_s / 86400;
+    uint32_t hours = (uptime_s % 86400) / 3600;
+    uint32_t mins  = (uptime_s % 3600) / 60;
+    uint32_t secs  = uptime_s % 60;
+
+    /* Heap */
+    uint32_t free_heap  = esp_get_free_heap_size();
+    uint32_t min_heap   = esp_get_minimum_free_heap_size();
+    uint32_t largest_blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+    /* WiFi */
+    const char *wifi_str;
+    char ip_buf[16] = "";
+    int8_t rssi = 0;
+    switch (network_get_status()) {
+    case NET_STATUS_CONNECTED:
+        wifi_str = "connected";
+        network_get_ip_str(ip_buf, sizeof(ip_buf));
+        {
+            wifi_ap_record_t ap;
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                rssi = ap.rssi;
+            }
+        }
+        break;
+    case NET_STATUS_CONNECTING:
+        wifi_str = "connecting";
+        break;
+    default:
+        wifi_str = "disconnected";
+        break;
+    }
+
+    /* SD bus mode */
+    const char *sd_mode = sd_control_get_bus_mode();
+    const char *probe_log = sd_control_get_probe_log();
+
+    /* Task count */
+    UBaseType_t task_count = uxTaskGetNumberOfTasks();
+
+    /* Firmware version from PROJECT_VER in CMakeLists.txt */
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf),
+        "{"
+        "\"version\":\"%s\","
+        "\"uptime\":\"%"PRIu32"d %"PRIu32"h %"PRIu32"m %"PRIu32"s\","
+        "\"uptime_s\":%"PRIu32","
+        "\"free_heap\":%"PRIu32","
+        "\"min_heap\":%"PRIu32","
+        "\"largest_block\":%"PRIu32","
+        "\"wifi_status\":\"%s\","
+        "\"ip\":\"%s\","
+        "\"rssi\":%d,"
+        "\"sd_bus\":\"%s\","
+        "\"sd_probe_log\":\"%s\","
+        "\"tasks\":%u"
+        "}",
+        app->version,
+        days, hours, mins, secs,
+        uptime_s,
+        free_heap,
+        min_heap,
+        largest_blk,
+        wifi_str,
+        ip_buf,
+        (int)rssi,
+        sd_mode,
+        probe_log,
+        (unsigned)task_count);
+    (void)n;
+
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
 /* ─── Server startup ──────────────────────────────────────────────── */
 
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
     config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.recv_wait_timeout = 60;  /* 60s for large uploads over weak WiFi */
-    config.send_wait_timeout = 60;
+    config.recv_wait_timeout = 30;  /* 60s for large uploads over weak WiFi */
+    config.send_wait_timeout = 30;
     config.lru_purge_enable = true;
 
     esp_err_t err = httpd_start(&s_server, &config);
@@ -1559,11 +1591,16 @@ esp_err_t web_server_start(void)
         { .uri = "/relinquish", .method = HTTP_GET,  .handler = handle_relinquish },
         { .uri = "/sd_access",  .method = HTTP_GET,  .handler = handle_sd_access_get },
         { .uri = "/sd_access",  .method = HTTP_POST, .handler = handle_sd_access_post },
+        { .uri = "/sd_esp_exclusive", .method = HTTP_GET,  .handler = handle_sd_esp_exclusive_get },
+        { .uri = "/sd_esp_exclusive", .method = HTTP_POST, .handler = handle_sd_esp_exclusive_post },
         { .uri = "/list",       .method = HTTP_GET,  .handler = handle_list },
         { .uri = "/download",   .method = HTTP_GET,  .handler = handle_download },
         { .uri = "/delete",     .method = HTTP_GET,  .handler = handle_delete },
-        { .uri = "/upload",     .method = HTTP_POST, .handler = handle_upload },
-        { .uri = "/rename",     .method = HTTP_POST, .handler = handle_rename },
+        { .uri = "/upload_begin",  .method = HTTP_POST, .handler = handle_upload_begin },
+        { .uri = "/upload_chunk",  .method = HTTP_POST, .handler = handle_upload_chunk },
+        { .uri = "/upload_end",    .method = HTTP_POST, .handler = handle_upload_end },
+        { .uri = "/upload_abort",  .method = HTTP_POST, .handler = handle_upload_abort },
+        { .uri = "/rename",         .method = HTTP_POST, .handler = handle_rename },
         { .uri = "/modeline",   .method = HTTP_POST, .handler = handle_modeline },
         { .uri = "/wifiap",     .method = HTTP_POST, .handler = handle_wifi_ap },
         { .uri = "/wificonnect",.method = HTTP_POST, .handler = handle_wifi_connect },
@@ -1575,6 +1612,10 @@ esp_err_t web_server_start(void)
         { .uri = "/ota_auth_check", .method = HTTP_GET, .handler = handle_ota_auth_check },
         { .uri = "/ota_password", .method = HTTP_GET,  .handler = handle_ota_password_get },
         { .uri = "/ota_password", .method = HTTP_POST, .handler = handle_ota_password_post },
+        { .uri = "/device_info", .method = HTTP_GET,  .handler = handle_device_info },
+        { .uri = "/sd_reprobe", .method = HTTP_POST, .handler = handle_sd_reprobe },
+        { .uri = "/ws/logs",    .method = HTTP_GET,  .handler = handle_ws_logs,
+                                .is_websocket = true },
         { .uri = "/*",          .method = HTTP_GET,     .handler = handle_static },
         { .uri = "/*",          .method = HTTP_OPTIONS, .handler = handle_options },
     };
@@ -1582,6 +1623,9 @@ esp_err_t web_server_start(void)
     for (int i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(s_server, &uris[i]);
     }
+
+    /* Install log hook to capture output into stream buffer */
+    s_orig_vprintf = esp_log_set_vprintf(log_vprintf_hook);
 
     ESP_LOGI(TAG, "HTTP server started on port 80");
     return ESP_OK;

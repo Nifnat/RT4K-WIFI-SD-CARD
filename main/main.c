@@ -23,17 +23,17 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* Configure power management: 80 MHz max, 40 MHz idle, light sleep */
+    /* Configure power management: 160 MHz max, 40 MHz idle, light sleep */
     #if CONFIG_PM_ENABLE
         esp_pm_config_t pm_config = {
-            .max_freq_mhz = 80,
+            .max_freq_mhz = 160,
             .min_freq_mhz = 40,
     #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
             .light_sleep_enable = true,
     #endif
         };
         ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-        ESP_LOGI(TAG, "Power management: 80/40 MHz, light sleep enabled");
+        ESP_LOGI(TAG, "Power management: 160/40 MHz, light sleep enabled");
     #endif
 
     /* Initialize SPIFFS for web UI static files */

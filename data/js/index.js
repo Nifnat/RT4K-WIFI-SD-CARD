@@ -8,6 +8,32 @@ if (navigator.userAgent.indexOf('MSIE') !== -1
     renderPage = false;
 }
 
+/**
+ * Show a non-blocking toast notification.
+ * @param {string} message  Text to display (newlines preserved)
+ * @param {string} [type]   'success' | 'error' | 'info' (default 'info')
+ * @param {number} [duration] Auto-dismiss ms (default 4000, 0 = manual only)
+ */
+function showToast(message, type, duration) {
+    type = type || 'info';
+    if (duration === undefined) duration = 4000;
+    var container = document.getElementById('toastContainer');
+    var el = document.createElement('div');
+    el.className = 'toast toast-' + type;
+    el.textContent = message;
+
+    function dismiss() {
+        if (el.parentNode) {
+            el.classList.add('toast-out');
+            setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 300);
+        }
+    }
+
+    el.addEventListener('click', dismiss);
+    container.appendChild(el);
+    if (duration > 0) setTimeout(dismiss, duration);
+}
+
 function httpRelinquishSD() {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', '/relinquish', true);
@@ -16,7 +42,7 @@ function httpRelinquishSD() {
 
 function onClickDelete(filename) {
     if(sdbusy) {
-        alert("SD card is busy");
+        showToast('SD card is busy', 'error');
         return
     }
     sdbusy = true;
@@ -29,17 +55,17 @@ function onClickDelete(filename) {
     };
     xhr.onerror = function () {
         sdbusy = false;
-        alert('Delete failed - connection error');
+        showToast('Delete failed - connection error', 'error');
     };
     xhr.onreadystatechange = function () {
         var resp = xhr.responseText;
 
         if( resp.startsWith('DELETE:')) {
             if(resp.includes('SDBUSY')) {
-                alert("Printer is busy, wait for 10s and try again");
+                showToast('Printer is busy, wait for 10s and try again', 'error');
             } else if(resp.includes('BADARGS') || 
                         resp.includes('BADPATH')) {
-                alert("Bad args, please try again or reset the module");
+                showToast('Bad args, please try again or reset the module', 'error');
             }
         }
     };
@@ -66,7 +92,7 @@ function getContentType(filename) {
 
 function onClickDownload(filename) {
     if(sdbusy) {
-        alert("SD card is busy");
+        showToast('SD card is busy', 'error');
         return
     }
     sdbusy = true;
@@ -108,7 +134,7 @@ function onClickDownload(filename) {
     };
     xhr.onerror = function (e) {
         sdbusy = false;
-        alert('Download failed!');
+        showToast('Download failed!', 'error');
         document.getElementById('probar').style.display="none";
     }
     xhr.send();
@@ -196,7 +222,7 @@ function fetchDirectory(path) {
                     const uploadButton = document.createElement('button');
                     uploadButton.textContent = 'Upload Here';
                     uploadButton.className = 'btn tm-bg-blue tm-text-white tm-dd';
-                    uploadButton.onclick = () => onClickUpload(`${path}/${item.name}`);
+                    uploadButton.onclick = () => openUploadModal(`${path}/${item.name}`);
                     itemDiv.appendChild(uploadButton);
                 } else {
                     if (isTextFile(item.name)) {
@@ -236,49 +262,117 @@ function fetchDirectory(path) {
         });
 }
 
-// File upload handling
-function onClickUpload(uploadPath = currentPath) {
-    const fileInput = document.getElementById('Choose');
-    const file = fileInput.files[0];
-    if (!file) {
-        alert('Please select a file to upload.');
-        return;
+// File upload handling — modal-based
+var uploadSelectedFile = null;
+var uploadTargetPath = null;
+
+function openUploadModal(targetPath) {
+    uploadTargetPath = targetPath || currentPath;
+    uploadSelectedFile = null;
+    document.getElementById('uploadFileInput').value = '';
+    document.getElementById('uploadFileInfo').style.display = 'none';
+    document.getElementById('uploadModalBtn').disabled = true;
+    document.getElementById('uploadModal').style.display = 'block';
+}
+
+function setUploadFile(file) {
+    if (!file) return;
+    uploadSelectedFile = file;
+    var info = document.getElementById('uploadFileInfo');
+    info.textContent = file.name + ' (' + niceBytes(file.size) + ')';
+    info.style.display = 'block';
+    document.getElementById('uploadModalBtn').disabled = false;
+}
+
+/**
+ * Upload a file in 32 KiB chunks with per-chunk error feedback.
+ * Server accumulates each chunk in RAM then writes to SD in one shot,
+ * separating WiFi activity from SD activity.  Response is held until
+ * the SD write finishes, so no artificial delay is needed.
+ */
+function chunkedUpload(file, path, onProgress) {
+    var CHUNK_SIZE = 32768;
+    var encodedPath = encodeURIComponent(path);
+    var encodedName = encodeURIComponent(file.name);
+
+    return fetch('/upload_begin?path=' + encodedPath + '&filename=' + encodedName, {
+        method: 'POST'
+    }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.error) return { ok: false, error: d.error };
+
+        var offset = 0;
+        function sendNext() {
+            if (offset >= file.size) {
+                return fetch('/upload_end', { method: 'POST' })
+                    .then(function(r) { return r.json(); })
+                    .then(function(d) {
+                        if (d.error) return { ok: false, error: d.error };
+                        return { ok: true, total: d.total, recv_ms: d.recv_ms, write_ms: d.write_ms };
+                    });
+            }
+            var end = Math.min(offset + CHUNK_SIZE, file.size);
+            var chunk = file.slice(offset, end);
+            return fetch('/upload_chunk', {
+                method: 'POST',
+                body: chunk
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                if (d.error) return { ok: false, error: d.error };
+                offset = end;
+                if (onProgress) onProgress(offset, file.size);
+                return sendNext();
+            });
+        }
+        return sendNext();
+    }).catch(function(err) {
+        try { fetch('/upload_abort', { method: 'POST' }); } catch(e) {}
+        return { ok: false, error: err.message || 'Network error' };
+    });
+}
+
+function doUpload() {
+    if (!uploadSelectedFile) return;
+    var file = uploadSelectedFile;
+    var uploadPath = uploadTargetPath || currentPath;
+
+    document.getElementById('uploadModal').style.display = 'none';
+
+    // Auto-enable SD access if not on
+    var chain = Promise.resolve();
+    if (!document.getElementById('sdAccessToggle').checked) {
+        chain = fetch('/sd_access', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'enable=1'
+        }).then(function(r) { return r.json(); }).then(function(d) {
+            if (d.enabled) {
+                document.getElementById('sdAccessToggle').checked = true;
+                updateSdLabel(true);
+            }
+        });
     }
 
-    const formData = new FormData();
-    formData.append('data', file);
+    chain.then(function() {
+        var pb = document.getElementById('progressbar');
+        document.getElementById('probar').style.display = 'block';
+        pb.max = file.size;
+        pb.value = 0;
 
-    const encodedPath = encodeURIComponent(uploadPath);
-    const uploadUrl = `/upload?path=${encodedPath}`;
-
-    document.getElementById('probar').style.display = 'block';
-    document.getElementById('uploadButton').disabled = true;
-
-    var xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = function(evt) {
-        if (evt.lengthComputable) {
-            var progressBar = document.getElementById('progressbar');
-            progressBar.max = evt.total;
-            progressBar.value = evt.loaded;
-        }
-    };
-    xhr.onload = function() {
+        return chunkedUpload(file, uploadPath, function(sent, total) {
+            pb.max = total;
+            pb.value = sent;
+        });
+    }).then(function(result) {
         document.getElementById('probar').style.display = 'none';
-        document.getElementById('uploadButton').disabled = false;
-        if (xhr.status === 200) {
-            alert('Upload successful!');
+        if (result.ok) {
+            showToast('Upload successful!', 'success');
             fetchDirectory(currentPath);
         } else {
-            alert('Upload failed: ' + xhr.responseText);
+            showToast('Upload failed: ' + result.error, 'error');
         }
-    };
-    xhr.onerror = function() {
+    }).catch(function(err) {
         document.getElementById('probar').style.display = 'none';
-        document.getElementById('uploadButton').disabled = false;
-        alert('Upload failed.');
-    };
-    xhr.open('POST', uploadUrl);
-    xhr.send(formData);
+        showToast('Upload failed: ' + err.message, 'error');
+    });
 }
 
 function onClickRename(fullPath, currentName) {
@@ -290,7 +384,7 @@ function onClickRename(fullPath, currentName) {
 
     // Basic validation
     if (newName.includes('/') || newName.includes('\\')) {
-        alert('File name cannot contain / or \\');
+        showToast('File name cannot contain / or \\', 'error');
         return;
     }
 
@@ -304,30 +398,30 @@ function onClickRename(fullPath, currentName) {
     .then(response => response.text())
     .then(result => {
         if (result === 'ok') {
-            alert(`Successfully renamed ${currentName} to ${newName}`);
+            showToast('Renamed ' + currentName + ' to ' + newName, 'success');
             fetchDirectory(currentPath);
         } else {
             switch(result) {
                 case 'RENAME:SDBUSY':
-                    alert('SD card is currently busy. Please try again.');
+                    showToast('SD card is currently busy. Please try again.', 'error');
                     break;
                 case 'RENAME:SOURCEMISSING':
-                    alert('The file you are trying to rename no longer exists.');
+                    showToast('The file you are trying to rename no longer exists.', 'error');
                     break;
                 case 'RENAME:DESTEXISTS':
-                    alert('A file with that name already exists.');
+                    showToast('A file with that name already exists.', 'error');
                     break;
                 case 'RENAME:FAILED':
-                    alert('Failed to rename file. Please try again.');
+                    showToast('Failed to rename file. Please try again.', 'error');
                     break;
                 default:
-                    alert('An error occurred while renaming the file.');
+                    showToast('An error occurred while renaming the file.', 'error');
             }
         }
     })
     .catch(error => {
         console.error('Error:', error);
-        alert('Failed to rename file. Please try again.');
+        showToast('Failed to rename file. Please try again.', 'error');
     });
 }
 
@@ -636,38 +730,51 @@ function ensureEditorReady() {
 
 document.addEventListener('DOMContentLoaded', function() {
     // SD access toggle
-    const sdToggle = document.getElementById('sdAccessToggle');
-    const sdLabel = document.getElementById('sdAccessLabel');
+    var sdToggle = document.getElementById('sdAccessToggle');
+    var sdLabel = document.getElementById('sdAccessLabel');
 
-    function updateSdLabel(enabled) {
+    window.updateSdLabel = function(enabled) {
         sdLabel.textContent = enabled ? 'SD Access: On' : 'SD Access: Off';
         sdLabel.style.color = enabled ? '#28a745' : '';
+    };
+
+    // ESP-exclusive UI elements
+    var espExLabel = document.getElementById('espExclusiveLabel');
+    var espExToggle = document.getElementById('espExclusiveToggle');
+    var rt4kFwBtn = document.getElementById('rt4kFwButton');
+    var diEspExCheckbox = document.getElementById('diEspExclusive');
+
+    function setDebugUiVisible(on) {
+        espExLabel.style.display = on ? 'inline-flex' : 'none';
     }
 
     // Check initial state
     fetch('/sd_access')
-        .then(r => r.json())
-        .then(data => {
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
             sdToggle.checked = data.enabled;
             updateSdLabel(data.enabled);
-            if (data.enabled) {
-                fetchDirectory('/');
+            if (data.enabled) fetchDirectory('/');
+            if (data.esp_exclusive) {
+                espExToggle.checked = true;
+                diEspExCheckbox.checked = true;
+                setDebugUiVisible(true);
             }
         })
-        .catch(() => {});
+        .catch(function() {});
 
     sdToggle.addEventListener('change', function() {
-        const enable = sdToggle.checked;
+        var enable = sdToggle.checked;
         fetch('/sd_access', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: 'enable=' + (enable ? '1' : '0')
         })
-        .then(r => r.json())
-        .then(data => {
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
             if (data.error) {
-                sdToggle.checked = !enable; // revert
-                alert('SD access error: ' + data.error);
+                sdToggle.checked = !enable;
+                showToast('SD access error: ' + data.error, 'error');
                 return;
             }
             sdToggle.checked = data.enabled;
@@ -679,33 +786,351 @@ document.addEventListener('DOMContentLoaded', function() {
                     '<p style="padding:10px;color:#888;">SD access disabled — enable to browse files.</p>';
             }
         })
-        .catch(err => {
-            sdToggle.checked = !enable; // revert
-            alert('Failed to toggle SD access: ' + err.message);
+        .catch(function(err) {
+            sdToggle.checked = !enable;
+            showToast('Failed to toggle SD access: ' + err.message, 'error');
         });
+    });
+
+    // ESP-exclusive toggle (toolbar)
+    espExToggle.addEventListener('change', function() {
+        var enable = espExToggle.checked;
+        fetch('/sd_esp_exclusive', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'enable=' + (enable ? '1' : '0')
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            espExToggle.checked = d.esp_exclusive;
+            diEspExCheckbox.checked = d.esp_exclusive;
+        })
+        .catch(function() { espExToggle.checked = !enable; });
+    });
+
+    // Debug tab ESP-exclusive checkbox
+    diEspExCheckbox.addEventListener('change', function() {
+        var enable = diEspExCheckbox.checked;
+        fetch('/sd_esp_exclusive', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'enable=' + (enable ? '1' : '0')
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            diEspExCheckbox.checked = d.esp_exclusive;
+            espExToggle.checked = d.esp_exclusive;
+            setDebugUiVisible(d.esp_exclusive);
+        })
+        .catch(function() { diEspExCheckbox.checked = !enable; });
     });
 
     // Don't auto-fetch — the sd_access check above will fetchDirectory if enabled
     document.getElementById('filelistbox').innerHTML =
         '<p style="padding:10px;color:#888;">SD access disabled — enable to browse files.</p>';
 
-    document.querySelector('.close').addEventListener('click', closeEditor);
-    
+    document.querySelector('#editorModal .close').addEventListener('click', closeEditor);
+
     $('.tm-current-year').text(new Date().getFullYear());
 
     window.onclick = function(event) {
-        const modal = document.getElementById('editorModal');
-        if (event.target == modal) {
-            closeEditor();
-        }
+        var modal = document.getElementById('editorModal');
+        if (event.target == modal) closeEditor();
+        if (event.target == document.getElementById('uploadModal')) document.getElementById('uploadModal').style.display = 'none';
+        if (event.target == document.getElementById('rt4kFwModal')) document.getElementById('rt4kFwModal').style.display = 'none';
     };
 
     document.getElementById('updateButton').addEventListener('click', function(e) { e.preventDefault(); updateList(); });
-    document.getElementById('uploadButton').addEventListener('click', () => onClickUpload());
+    document.getElementById('uploadButton').addEventListener('click', function() { openUploadModal(); });
+
+    // ── Upload modal wiring ──
+    var uploadDZ = document.getElementById('uploadDropZone');
+    var uploadFI = document.getElementById('uploadFileInput');
+
+    uploadDZ.addEventListener('click', function() { uploadFI.click(); });
+    uploadFI.addEventListener('change', function() { if (uploadFI.files[0]) setUploadFile(uploadFI.files[0]); });
+    uploadDZ.addEventListener('dragover', function(e) { e.preventDefault(); uploadDZ.classList.add('drag-over'); });
+    uploadDZ.addEventListener('dragleave', function() { uploadDZ.classList.remove('drag-over'); });
+    uploadDZ.addEventListener('drop', function(e) {
+        e.preventDefault(); uploadDZ.classList.remove('drag-over');
+        if (e.dataTransfer.files[0]) setUploadFile(e.dataTransfer.files[0]);
+    });
+    document.getElementById('uploadModalBtn').addEventListener('click', doUpload);
+    document.getElementById('uploadModalCancel').addEventListener('click', function() { document.getElementById('uploadModal').style.display = 'none'; });
+    document.getElementById('uploadModalClose').addEventListener('click', function() { document.getElementById('uploadModal').style.display = 'none'; });
+
+    // ── RT4K FW upload modal wiring ──
+    var rt4kDZ = document.getElementById('rt4kFwDropZone');
+    var rt4kFI = document.getElementById('rt4kFwFileInput');
+    var rt4kSelectedFile = null;
+
+    rt4kFwBtn.addEventListener('click', function() {
+        rt4kSelectedFile = null;
+        rt4kFI.value = '';
+        document.getElementById('rt4kFwFileInfo').style.display = 'none';
+        document.getElementById('rt4kFwModalBtn').disabled = true;
+        document.getElementById('rt4kFwModal').style.display = 'block';
+    });
+
+    function setRt4kFwFile(file) {
+        if (!file) return;
+        rt4kSelectedFile = file;
+        var info = document.getElementById('rt4kFwFileInfo');
+        info.textContent = file.name + ' (' + niceBytes(file.size) + ')';
+        info.style.display = 'block';
+        document.getElementById('rt4kFwModalBtn').disabled = false;
+    }
+
+    rt4kDZ.addEventListener('click', function() { rt4kFI.click(); });
+    rt4kFI.addEventListener('change', function() { if (rt4kFI.files[0]) setRt4kFwFile(rt4kFI.files[0]); });
+    rt4kDZ.addEventListener('dragover', function(e) { e.preventDefault(); rt4kDZ.classList.add('drag-over'); });
+    rt4kDZ.addEventListener('dragleave', function() { rt4kDZ.classList.remove('drag-over'); });
+    rt4kDZ.addEventListener('drop', function(e) {
+        e.preventDefault(); rt4kDZ.classList.remove('drag-over');
+        if (e.dataTransfer.files[0]) setRt4kFwFile(e.dataTransfer.files[0]);
+    });
+    document.getElementById('rt4kFwModalCancel').addEventListener('click', function() { document.getElementById('rt4kFwModal').style.display = 'none'; });
+    document.getElementById('rt4kFwModalClose').addEventListener('click', function() { document.getElementById('rt4kFwModal').style.display = 'none'; });
+
+    document.getElementById('rt4kFwModalBtn').addEventListener('click', function() {
+        if (!rt4kSelectedFile) return;
+        var file = rt4kSelectedFile;
+        document.getElementById('rt4kFwModal').style.display = 'none';
+
+        // Save previous state
+        var prevSdAccess = document.getElementById('sdAccessToggle').checked;
+        var prevEspEx = espExToggle.checked;
+
+        // Force ESP-exclusive + SD access on
+        var setup = Promise.resolve();
+        setup = setup.then(function() {
+            return fetch('/sd_esp_exclusive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'enable=1'
+            });
+        }).then(function() {
+            return fetch('/sd_access', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'enable=1'
+            });
+        });
+
+        setup.then(function() {
+            var pb = document.getElementById('progressbar');
+            document.getElementById('probar').style.display = 'block';
+            pb.max = file.size;
+            pb.value = 0;
+
+            function revert() {
+                document.getElementById('probar').style.display = 'none';
+                // Revert ESP-exclusive
+                fetch('/sd_esp_exclusive', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'enable=' + (prevEspEx ? '1' : '0')
+                }).then(function(r) { return r.json(); }).then(function(d) {
+                    espExToggle.checked = d.esp_exclusive;
+                    diEspExCheckbox.checked = d.esp_exclusive;
+                });
+                // Revert SD access
+                if (!prevSdAccess) {
+                    fetch('/sd_access', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: 'enable=0'
+                    }).then(function(r) { return r.json(); }).then(function(d) {
+                        sdToggle.checked = d.enabled;
+                        updateSdLabel(d.enabled);
+                    });
+                }
+            }
+
+            chunkedUpload(file, '/', function(sent, total) {
+                pb.max = total;
+                pb.value = sent;
+            }).then(function(result) {
+                if (result.ok) {
+                    showToast('RT4K firmware uploaded successfully!', 'success');
+                    fetchDirectory(currentPath);
+                } else {
+                    showToast('RT4K FW upload failed: ' + result.error, 'error');
+                }
+                revert();
+            }).catch(function(err) {
+                showToast('RT4K FW upload failed: ' + err.message, 'error');
+                revert();
+            });
+        }).catch(function(err) {
+            showToast('Failed to set up RT4K FW upload: ' + err.message, 'error');
+        });
+    });
+
+    // Device info modal
+    var diModal = document.getElementById('deviceInfoModal');
+    var diClose = document.getElementById('deviceInfoClose');
+
+    document.getElementById('deviceInfoButton').addEventListener('click', function(e) {
+        e.preventDefault();
+        diModal.style.display = 'block';
+        activateDiTab('status');
+    });
+    diClose.addEventListener('click', closeDiModal);
+    window.addEventListener('click', function(e) {
+        if (e.target === diModal) closeDiModal();
+    });
+
+    // Tab switching
+    document.querySelectorAll('.di-tab').forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            activateDiTab(tab.dataset.tab);
+        });
+    });
+
+    // Renegotiate SD
+    document.getElementById('diRenegotiate').addEventListener('click', function() {
+        var btn = this;
+        btn.disabled = true;
+        btn.textContent = 'Renegotiating...';
+        fetch('/sd_reprobe', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                btn.textContent = 'Renegotiate SD';
+                btn.disabled = false;
+                showToast('SD bus: ' + d.sd_bus + '\n' + d.probe_log, 'info', 6000);
+            })
+            .catch(function(err) {
+                btn.textContent = 'Renegotiate SD';
+                btn.disabled = false;
+                showToast('Renegotiation failed: ' + err.message, 'error');
+            });
+    });
+
+    // Clear logs
+    document.getElementById('diClearLogs').addEventListener('click', function() {
+        document.getElementById('diLogOutput').textContent = '';
+    });
 });
 
 function updateList() {
     fetchDirectory(currentPath);
+}
+
+function fetchDeviceInfo() {
+    var body = document.getElementById('diTabStatus');
+    body.innerHTML = '<p style="color:#888;">Loading...</p>';
+
+    fetch('/device_info')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var fragPct = d.free_heap > 0
+                ? (100 - (d.largest_block / d.free_heap * 100)).toFixed(1)
+                : '0.0';
+            var rssiBar = '';
+            if (d.wifi_status === 'connected') {
+                var q = d.rssi >= -50 ? 4 : d.rssi >= -60 ? 3 : d.rssi >= -70 ? 2 : 1;
+                rssiBar = ' (' + d.rssi + ' dBm, ' + ['Poor','Fair','Good','Excellent'][q-1] + ')';
+            }
+            body.innerHTML =
+                '<table style="width:100%;border-collapse:collapse;">' +
+                infoRow('Firmware', 'v' + d.version) +
+                infoRow('Uptime', d.uptime) +
+                infoRow('Free Heap', niceBytes(d.free_heap)) +
+                infoRow('Min Free Heap', niceBytes(d.min_heap)) +
+                infoRow('Largest Free Block', niceBytes(d.largest_block)) +
+                infoRow('Heap Fragmentation', fragPct + '%') +
+                infoRow('WiFi Status', d.wifi_status + (d.ip ? ' — ' + d.ip : '') + rssiBar) +
+                infoRow('SD Bus Mode', d.sd_bus) +
+                infoRow('SD Probe Log', d.sd_probe_log || 'n/a') +
+                infoRow('Tasks Running', d.tasks) +
+                '</table>';
+        })
+        .catch(function(err) {
+            body.innerHTML = '<p style="color:#b35e6c;">Failed to load device info: ' + err.message + '</p>';
+        });
+}
+
+function infoRow(label, value) {
+    return '<tr>' +
+        '<td style="padding:6px 10px;color:#b0b0b0;white-space:nowrap;">' + label + '</td>' +
+        '<td style="padding:6px 10px;color:#e0e0e0;">' + value + '</td>' +
+        '</tr>';
+}
+
+/* ─── Tab management ──────────────────────────────────────────────── */
+
+var logWs = null;
+var logPollInterval = null;
+
+function activateDiTab(name) {
+    document.querySelectorAll('.di-tab').forEach(function(t) {
+        t.classList.toggle('active', t.dataset.tab === name);
+    });
+    document.getElementById('diTabStatus').style.display = name === 'status' ? 'block' : 'none';
+    var logsPane = document.getElementById('diTabLogs');
+    logsPane.style.display = name === 'logs' ? 'flex' : 'none';
+    document.getElementById('diTabDebug').style.display = name === 'debug' ? 'block' : 'none';
+
+    if (name === 'status') fetchDeviceInfo();
+    if (name === 'logs') connectLogWs();
+    if (name === 'debug') {
+        fetch('/sd_esp_exclusive')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                document.getElementById('diEspExclusive').checked = d.esp_exclusive;
+            })
+            .catch(function() {});
+    }
+}
+
+function closeDiModal() {
+    document.getElementById('deviceInfoModal').style.display = 'none';
+    disconnectLogWs();
+}
+
+/* ─── WebSocket log streaming ─────────────────────────────────────── */
+
+function connectLogWs() {
+    if (logWs && logWs.readyState <= 1) return;
+
+    var host = location.hostname || 'localhost';
+    var port = location.port || '80';
+    logWs = new WebSocket('ws://' + host + ':' + port + '/ws/logs');
+
+    logWs.onopen = function() {
+        logWs.send('init');
+        logPollInterval = setInterval(function() {
+            if (logWs && logWs.readyState === 1) logWs.send('p');
+        }, 2000);
+    };
+
+    logWs.onmessage = function(evt) {
+        var pre = document.getElementById('diLogOutput');
+        pre.textContent += evt.data;
+        /* Cap browser-side buffer at ~200 KB */
+        if (pre.textContent.length > 200000) {
+            pre.textContent = pre.textContent.slice(-100000);
+        }
+        if (document.getElementById('diAutoScroll').checked) {
+            pre.scrollTop = pre.scrollHeight;
+        }
+    };
+
+    logWs.onclose = function() {
+        clearInterval(logPollInterval);
+        logPollInterval = null;
+        logWs = null;
+    };
+
+    logWs.onerror = function() {
+        if (logWs) logWs.close();
+    };
+}
+
+function disconnectLogWs() {
+    if (logPollInterval) { clearInterval(logPollInterval); logPollInterval = null; }
+    if (logWs) { logWs.close(); logWs = null; }
 }
 
 function openEditor(filePath) {
@@ -751,7 +1176,7 @@ function openEditor(filePath) {
         .catch(error => {
             console.error('Error loading file:', error);
             saveButton.disabled = false;
-            alert('Failed to load file for editing.');
+            showToast('Failed to load file for editing.', 'error');
             closeEditor();
         });
 }
@@ -762,7 +1187,7 @@ function closeEditor() {
 
 function saveFile() {
     if (!editorApi || !currentEditingFile) {
-        alert('Editor is still loading. Please try again in a moment.');
+        showToast('Editor is still loading. Please try again in a moment.', 'info');
         return;
     }
 
@@ -781,13 +1206,13 @@ function saveFile() {
     })
     .then(response => response.text())
     .then(data => {
-        alert('File saved successfully!');
+        showToast('File saved successfully!', 'success');
         closeEditor();
         fetchDirectory(currentPath);
     })
     .catch(error => {
         console.error('Error saving file:', error);
-        alert('Failed to save file.');
+        showToast('Failed to save file.', 'error');
     });
 }
 

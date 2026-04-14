@@ -17,17 +17,23 @@
 </head>
 
 <body>
+  <div id="toastContainer"></div>
   <div class="container">
     <div class="tm-file-form-container mt-4">
       <form class="form-inline tm-file-form">
-			<input type="file" id="Choose" value="Choose" class="tm-file-input form-control" name="data">
 			<input id="uploadButton" type="button" value="Upload" class="form-control tm-file-submit">
+			<input id="rt4kFwButton" type="button" value="RT4K FW Upload" class="form-control tm-file-submit">
 			<a href="#" id="updateButton" class="form-control tm-file-submit tm-nav-btn">Update List</a>
 			<a href="video_timings_calculator.htm" id="modelineButton" class="form-control tm-file-submit tm-nav-btn">Modeline Editor</a>
 			<a href="settings.htm" id="settings" class="form-control tm-file-submit tm-nav-btn">Settings</a>
+			<a href="#" id="deviceInfoButton" class="form-control tm-file-submit tm-nav-btn">Device Info</a>
 			<label style="margin-left:15px; display:inline-flex; align-items:center; cursor:pointer;">
 				<input type="checkbox" id="sdAccessToggle" style="margin-right:5px;">
 				<span id="sdAccessLabel">SD Access: Off</span>
+			</label>
+			<label id="espExclusiveLabel" style="margin-left:10px; display:none; align-items:center; cursor:pointer;">
+				<input type="checkbox" id="espExclusiveToggle" style="margin-right:5px;">
+				<span>ESP Locked</span>
 			</label>
       </form>
         </div>
@@ -47,6 +53,44 @@
 		</div>
 	</div>
 
+	<!-- Upload Modal -->
+	<div id="uploadModal" class="modal">
+		<div class="modal-content" style="width:min(92vw,500px);height:auto;max-height:min(92vh,400px);">
+			<div class="modal-header">
+				<span class="close" id="uploadModalClose">&times;</span>
+				<h2>Upload File</h2>
+			</div>
+			<div id="uploadDropZone" class="drop-zone">
+				<p>Drag &amp; drop a file here, or click to browse</p>
+				<input type="file" id="uploadFileInput" style="display:none;">
+			</div>
+			<div id="uploadFileInfo" style="display:none;padding:8px 12px;color:#b0b0b0;"></div>
+			<div style="padding:12px;display:flex;gap:8px;justify-content:flex-end;">
+				<button id="uploadModalBtn" class="form-control tm-file-submit" disabled>Upload</button>
+				<button id="uploadModalCancel" class="form-control tm-file-submit">Cancel</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- RT4K FW Upload Modal -->
+	<div id="rt4kFwModal" class="modal">
+		<div class="modal-content" style="width:min(92vw,500px);height:auto;max-height:min(92vh,400px);">
+			<div class="modal-header">
+				<span class="close" id="rt4kFwModalClose">&times;</span>
+				<h2>RT4K Firmware Upload</h2>
+			</div>
+			<div id="rt4kFwDropZone" class="drop-zone">
+				<p>Drag &amp; drop firmware file here, or click to browse</p>
+				<input type="file" id="rt4kFwFileInput" style="display:none;" accept=".rbf">
+			</div>
+			<div id="rt4kFwFileInfo" style="display:none;padding:8px 12px;color:#b0b0b0;"></div>
+			<div style="padding:12px;display:flex;gap:8px;justify-content:flex-end;">
+				<button id="rt4kFwModalBtn" class="form-control tm-file-submit" disabled>Upload</button>
+				<button id="rt4kFwModalCancel" class="form-control tm-file-submit">Cancel</button>
+			</div>
+		</div>
+	</div>
+
     <div class="file-boxes progress-stripes" id="probar">
       <progress class="file-boxes" id="progressbar" value="0" max="100"></progress>
     </div>
@@ -58,6 +102,41 @@
         </div> <!-- filelistbox -->
       </div>
     </div>
+
+	<div id="deviceInfoModal" class="modal">
+		<div class="modal-content" style="width:min(92vw,600px);height:min(92vh,600px);display:flex;flex-direction:column;">
+			<div class="modal-header">
+				<span class="close" id="deviceInfoClose">&times;</span>
+				<h2>Device Info</h2>
+			</div>
+			<div class="di-tabs">
+				<button class="di-tab active" data-tab="status">Status</button>
+				<button class="di-tab" data-tab="logs">Logs</button>
+				<button class="di-tab" data-tab="debug">Debug</button>
+			</div>
+			<div id="diTabStatus" class="di-tab-content" style="padding:12px;overflow-y:auto;flex:1;">
+				<p style="color:#888;">Loading...</p>
+			</div>
+			<div id="diTabLogs" class="di-tab-content" style="padding:12px;display:none;flex:1;display:none;flex-direction:column;">
+				<div style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+					<button id="diRenegotiate" class="form-control tm-file-submit">Renegotiate SD</button>
+					<button id="diClearLogs" class="form-control tm-file-submit">Clear</button>
+					<label style="margin-left:auto;color:#b0b0b0;display:flex;align-items:center;gap:4px;">
+						<input type="checkbox" id="diAutoScroll" checked> Auto-scroll
+					</label>
+				</div>
+				<pre id="diLogOutput" style="background:#1a1a1a;color:#ccc;padding:8px;border-radius:4px;flex:1;overflow-y:auto;font-size:12px;margin:0;white-space:pre-wrap;word-break:break-all;min-height:0;"></pre>
+			</div>
+			<div id="diTabDebug" class="di-tab-content" style="padding:12px;display:none;overflow-y:auto;flex:1;">
+				<h4 style="margin-top:0;color:#b0b0b0;">Debug Options</h4>
+				<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:12px;">
+					<input type="checkbox" id="diEspExclusive">
+					<span style="color:#e0e0e0;">Enable ESP-locked SD access</span>
+				</label>
+				<p style="color:#888;font-size:12px;margin:0;">When enabled, a &ldquo;ESP Locked&rdquo; toggle and the &ldquo;RT4K FW Upload&rdquo; button appear in the toolbar. ESP-locked mode bypasses the RT4K bus-sharing safety check.</p>
+			</div>
+		</div>
+	</div>
 
     <footer class="row">
       <div class="col-xl-12">
