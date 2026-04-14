@@ -19,6 +19,11 @@
 # IDE and editor specific files
 .vscode/
 
+# My messy folders
+ppk/
+scratch/
+
+
 
 # Build artifacts and directories
 **/build/
