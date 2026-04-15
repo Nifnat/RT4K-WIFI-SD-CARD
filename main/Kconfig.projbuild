@@ -1,0 +1,14 @@
+menu "SD Card"
+
+    config SD_DISABLE_SDMMC
+        bool "Disable SDMMC (use SPI-only mode)"
+        default y
+        help
+            When enabled, the SD card driver skips SDMMC host probing entirely
+            and falls back directly to SPI mode on every mount attempt.
+
+            Useful when SDMMC is unavailable or is causing instability on your
+            hardware revision. Toggle for SDMMC operation, which tries SDMMC
+            1-bit first and falls back to SPI automatically.
+
+endmenu

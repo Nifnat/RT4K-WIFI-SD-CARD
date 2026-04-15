@@ -236,8 +236,8 @@ void sd_control_take(void)
 
     esp_err_t err = ESP_FAIL;
 
-
     /* ── Try SDMMC 1-bit, then SPI fallback ── */
+#if !CONFIG_SD_DISABLE_SDMMC
     if (s_sdmmc_width == 1) {
         /* SDMMC previously worked — try it directly (skip full probe) */
         sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -256,33 +256,36 @@ void sd_control_take(void)
         }
     }
 
-    // /* Probe path: entered on first mount, after cached-SDMMC failure,
-    //  * AND after SPI fallback (s_sdmmc_width == -1) so we always
-    //  * re-attempt SDMMC in case the RT4K is no longer on the bus. */
-    // if (s_sdmmc_width <= 0 && err != ESP_OK) {
-    //     probe_log_set("Probing @ %d kHz: ", SDMMC_FREQ_KHZ);
+    /* Probe path: entered on first mount, after cached-SDMMC failure,
+     * AND after SPI fallback (s_sdmmc_width == -1) so we always
+     * re-attempt SDMMC in case the RT4K is no longer on the bus. */
+    if (s_sdmmc_width <= 0 && err != ESP_OK) {
+        probe_log_set("Probing @ %d kHz: ", SDMMC_FREQ_KHZ);
 
-    //     /* Try 1-bit SDMMC — single attempt; if the RT4K's host
-    //      * controller is holding the bus we won't recover with retries. */
-    //     sdmmc_host_t host1 = SDMMC_HOST_DEFAULT();
-    //     host1.max_freq_khz = SDMMC_FREQ_KHZ;
-    //     host1.flags = SDMMC_HOST_FLAG_1BIT;
+        /* Try 1-bit SDMMC — single attempt; if the RT4K's host
+         * controller is holding the bus we won't recover with retries. */
+        sdmmc_host_t host1 = SDMMC_HOST_DEFAULT();
+        host1.max_freq_khz = SDMMC_FREQ_KHZ;
+        host1.flags = SDMMC_HOST_FLAG_1BIT;
 
-    //     sdmmc_slot_config_t slot1 = SDMMC_SLOT_CONFIG_DEFAULT();
-    //     slot1.width = 1;
+        sdmmc_slot_config_t slot1 = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot1.width = 1;
 
-    //     err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host1, &slot1,
-    //                                    &mount_cfg, &s_card);
-    //     if (err == ESP_OK) {
-    //         s_sdmmc_width = 1;
-    //         probe_log_cat("1-bit OK");
-    //         ESP_LOGI(TAG, "SD card mounted via SDMMC 1-bit @ %d kHz", SDMMC_FREQ_KHZ);
-    //     } else {
-    //         probe_log_cat("1-bit: %s", esp_err_to_name(err));
-    //         ESP_LOGW(TAG, "SDMMC 1-bit failed: %s, falling back to SPI", esp_err_to_name(err));
-    //     }
-    // }
-
+        err = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host1, &slot1,
+                                       &mount_cfg, &s_card);
+        if (err == ESP_OK) {
+            s_sdmmc_width = 1;
+            probe_log_cat("1-bit OK");
+            ESP_LOGI(TAG, "SD card mounted via SDMMC 1-bit @ %d kHz", SDMMC_FREQ_KHZ);
+        } else {
+            probe_log_cat("1-bit: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "SDMMC 1-bit failed: %s, falling back to SPI", esp_err_to_name(err));
+        }
+    }
+#else
+    /* SDMMC disabled by config — go straight to SPI */
+    probe_log_set("SDMMC disabled, SPI only");
+#endif
 
     /* ── SPI fallback ── */
     if (err != ESP_OK) {
@@ -485,11 +488,16 @@ bool sd_control_is_esp_exclusive(void)
 const char *sd_control_get_bus_mode(void)
 {
     if (!s_access_enabled) return "disabled";
+#if CONFIG_SD_DISABLE_SDMMC
+    if (s_sdmmc_width == -1) return "SPI (SDMMC disabled)";
+    return "not yet probed";
+#else
     switch (s_sdmmc_width) {
     case 1:  return "SDMMC 1-bit";
     case -1: return "SPI";
     default: return "not yet probed";
     }
+#endif
 }
 
 const char *sd_control_get_probe_log(void)
@@ -506,8 +514,12 @@ esp_err_t sd_control_reprobe(void)
         sd_control_relinquish();
     }
 
-    /* Reset probe cache to force fresh negotiation */
+    /* Reset probe cache to force fresh negotiation.
+     * When SDMMC is disabled the only valid state is 0 or -1 (SPI), so
+     * we leave s_sdmmc_width alone — there is nothing to re-probe for SDMMC. */
+#if !CONFIG_SD_DISABLE_SDMMC
     s_sdmmc_width = 0;
+#endif
 
     /* Re-take with fresh probe */
     sd_control_take();
